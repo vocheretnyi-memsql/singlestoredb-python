@@ -173,7 +173,7 @@ register_option(
         check_str,
         valid_values=[
             'tuple', 'tuples', 'namedtuple', 'namedtuples',
-            'dict', 'dicts',
+            'dict', 'dicts', 'array', 'dataframe', 'arrow',
         ],
     ),
     'tuples',

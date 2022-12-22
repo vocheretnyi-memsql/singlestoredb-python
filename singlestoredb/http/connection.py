@@ -808,7 +808,7 @@ class Connection(connection.Connection):
             return
         raise NotSupportedError(msg='operation not supported')
 
-    def cursor(self) -> Cursor:
+    def cursor(self, parallel: bool = False) -> Cursor:
         """
         Create a new cursor object.
 
@@ -817,6 +817,8 @@ class Connection(connection.Connection):
         Cursor
 
         """
+        if parallel:
+            raise NotImplementedError('HTTP connections can not use parallel readers')
         return Cursor(self)
 
     def __enter__(self) -> 'Connection':

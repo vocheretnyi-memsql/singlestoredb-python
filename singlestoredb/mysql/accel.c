@@ -1,6 +1,4 @@
 
-#define Py_LIMITED_API 0x03060000
-
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -10,9 +8,12 @@
 #include <datetime.h>
 #endif
 
-#define MYSQLSV_OUT_TUPLES 0
-#define MYSQLSV_OUT_NAMEDTUPLES 1
-#define MYSQLSV_OUT_DICTS 2
+#define RESULTS_TYPE_TUPLES 0
+#define RESULTS_TYPE_NAMEDTUPLES 1
+#define RESULTS_TYPE_DICTS 2
+#define RESULTS_TYPE_ARRAY 3
+#define RESULTS_TYPE_DATAFRAME 4
+#define RESULTS_TYPE_ARROW 5
 
 #define MYSQL_FLAG_NOT_NULL 1
 #define MYSQL_FLAG_PRI_KEY 2
@@ -72,6 +73,9 @@
 
 // 2**24 - 1
 #define MYSQL_MAX_PACKET_LEN 16777215
+
+#define EPOCH_TO_DAYS 719528
+#define SECONDS_PER_DAY (24 * 60 * 60)
 
 #define MYSQLSV_OPTION_TIME_TYPE_TIMEDELTA 0
 #define MYSQLSV_OPTION_TIME_TYPE_TIME 1
@@ -309,6 +313,8 @@ typedef struct {
 inline int IMAX(int a, int b) { return((a) > (b) ? a : b); }
 inline int IMIN(int a, int b) { return((a) < (b) ? a : b); }
 
+#ifdef Py_LIMITED_API
+
 char *PyUnicode_AsUTF8(PyObject *unicode) {
     PyObject *bytes = PyUnicode_AsEncodedString(unicode, "utf-8", "strict");
     if (!bytes) return NULL;
@@ -323,6 +329,8 @@ char *PyUnicode_AsUTF8(PyObject *unicode) {
     memcpy(out, str, str_l);
     return out;
 }
+
+#endif
 
 //
 // Cached int values for date/time components
@@ -364,6 +372,31 @@ typedef struct {
     PyObject *_read_timeout;
     PyObject *_next_seq_id;
     PyObject *rows;
+    PyObject *NaT;
+    PyObject *table;
+    PyObject *DataFrame;
+    PyObject *array;
+    PyObject *column_stack;
+    PyObject *O;
+    PyObject *u1;
+    PyObject *u2;
+    PyObject *u4;
+    PyObject *u8;
+    PyObject *i1;
+    PyObject *i2;
+    PyObject *i4;
+    PyObject *i8;
+    PyObject *f4;
+    PyObject *f8;
+    PyObject *datetime_ns;
+    PyObject *shape;
+    PyObject *typestr;
+    PyObject *data;
+    PyObject *copy;
+    PyObject *core;
+    PyObject *records;
+    PyObject *fromarrays;
+    PyObject *names;
 } PyStrings;
 
 static PyStrings PyStr = {0};
@@ -378,9 +411,37 @@ typedef struct {
     PyObject *datetime_time;
     PyObject *datetime_timedelta;
     PyObject *datetime_datetime;
+    PyObject *pandas_DataFrame;
+    PyObject *pyarrow_table;
+    PyObject *numpy_array;
+    PyObject *numpy_core_records_fromarrays;
+    PyObject *numpy_column_stack;
 } PyFunctions;
 
 static PyFunctions PyFunc = {0};
+
+//
+// Cached Python modules
+//
+typedef struct {
+    PyObject *numpy;
+    PyObject *datetime;
+    PyObject *decimal;
+    PyObject *json;
+    PyObject *pandas;
+    PyObject *pyarrow;
+} PyModules;
+
+static PyModules PyMod = {0};
+
+//
+// Cached Python constants
+//
+//typedef struct {
+//    PyObject *numpy_NaT;
+//} PyConstants;
+
+//static PyConstants PyConst = {0};
 
 //
 // State
@@ -417,10 +478,12 @@ typedef struct {
     PyStructSequence_Desc namedtuple_desc;
     int unbuffered; // Are we running in unbuffered mode?
     int is_eof; // Have we hit the eof packet yet?
-    struct {
-        PyObject *_next_seq_id;
-        PyObject *rows;
-    } py_str;
+    float float_nan; // Only used in numpy output
+    double double_nan; // Only used in numpy output
+    char *output_file; // File prefix for parquet output
+    char **buffer; // Array buffers for numpy output
+    unsigned long long buffer_n_rows; // Total numbef or allocated rows in numpy output
+    unsigned long long buffer_row_idx; // The next row to be filled in numpy output
 } StateObject;
 
 static void read_options(MySQLAccelOptions *options, PyObject *dict);
@@ -459,6 +522,12 @@ static void State_clear_fields(StateObject *self) {
         }
         DESTROY(self->py_invalid_values);
     }
+    //if (self->buffer) {
+    //    for (unsigned long i = 0; i < self->n_cols; i++) {
+    //        DESTROY(self->buffer[i]);
+    //    }
+    //    DESTROY(self->buffer);
+    //}
     Py_CLEAR(self->namedtuple);
     Py_CLEAR(self->py_default_converters);
     Py_CLEAR(self->py_settimeout);
@@ -513,6 +582,9 @@ static int State_init(StateObject *self, PyObject *args, PyObject *kwds) {
         }
         Py_XDECREF(unbuffered_active);
     }
+
+    self->float_nan = nanf("");
+    self->double_nan = nan("");
 
     // Retrieve type codes for each column.
     PyObject *py_field_count = PyObject_GetAttr(py_res, PyStr.field_count);
@@ -647,7 +719,12 @@ static int State_init(StateObject *self, PyObject *args, PyObject *kwds) {
     }
 
     switch (self->options.results_type) {
-    case MYSQLSV_OUT_NAMEDTUPLES:
+    case RESULTS_TYPE_ARRAY:
+    case RESULTS_TYPE_DATAFRAME:
+    case RESULTS_TYPE_ARROW:
+        break;
+
+    case RESULTS_TYPE_NAMEDTUPLES:
         self->namedtuple_desc.name = "singlestoredb.Row";
         self->namedtuple_desc.doc = "Row of data values";
         self->namedtuple_desc.n_in_sequence = self->n_cols;
@@ -663,13 +740,7 @@ static int State_init(StateObject *self, PyObject *args, PyObject *kwds) {
         // Fall through
 
     default:
-        // For fetchone, reuse the same list every time.
-        //if (requested_n_rows == 1) {
-        //    self->py_rows = PyList_New(1);
-        //    PyList_SetItem(self->py_rows, 0, Py_None);
-        //} else {
-            self->py_rows = PyList_New(0);
-        //}
+        self->py_rows = PyList_New(0);
         if (!self->py_rows) goto error;
 
         PyObject_SetAttr(py_res, PyStr.rows, self->py_rows);
@@ -678,9 +749,6 @@ static int State_init(StateObject *self, PyObject *args, PyObject *kwds) {
 exit:
     Py_XDECREF(py_converters);
     Py_XDECREF(py_options);
-    if (PyErr_Occurred()) {
-        PyErr_Print();
-    }
     return rc;
 
 error:
@@ -699,13 +767,18 @@ static int State_reset_batch(
 
     self->n_rows_in_batch = 0;
 
-    //if (requested_n_rows != 1) {
+    switch (self->options.results_type) {
+    case RESULTS_TYPE_ARRAY:
+    case RESULTS_TYPE_DATAFRAME:
+    case RESULTS_TYPE_ARROW:
+        break;
+    default:
         py_tmp = self->py_rows;
         self->py_rows = PyList_New(0);
         Py_XDECREF(py_tmp);
         if (!self->py_rows) { rc = -1; goto error; }
         rc = PyObject_SetAttr(py_res, PyStr.rows, self->py_rows);
-    //}
+    }
 
 exit:
     return rc;
@@ -717,7 +790,7 @@ error:
 static PyType_Slot StateType_slots[] = {
     {Py_tp_init, (initproc)State_init},
     {Py_tp_dealloc, (destructor)State_dealloc},
-    {Py_tp_doc, "PyMySQL accelerator"},
+    {Py_tp_doc, "PyMySQL accelerator state"},
     {0, NULL},
 };
 
@@ -733,6 +806,79 @@ static PyType_Spec StateType_spec = {
 // End State
 //
 
+//
+// Array
+//
+
+static PyTypeObject *ArrayType = NULL;
+
+typedef struct {
+    PyObject_HEAD
+    PyObject *py_array_interface;
+} ArrayObject;
+
+static void Array_dealloc(ArrayObject *self) {
+    if (self->py_array_interface) {
+        PyObject *data = PyDict_GetItem(self->py_array_interface, PyStr.data);
+        if (data) {
+            PyObject *buffer = PyTuple_GetItem(data, 0);
+            if (buffer) {
+                //free((char*)PyLong_AsUnsignedLongLong(buffer));
+            }
+        }
+    }
+    PyObject_Del(self);
+}
+
+static int Array_init(ArrayObject *self, PyObject *args, PyObject *kwds) {
+    static char *kwlist[] = {"array_interface", NULL};
+    PyObject *py_array_interface = NULL;
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwds, "O", kwlist, &py_array_interface)) {
+        return -1;
+    }
+
+    if (py_array_interface) {
+        PyObject *tmp = self->py_array_interface;
+        Py_INCREF(py_array_interface);
+        self->py_array_interface = py_array_interface;
+        Py_XDECREF(tmp);
+    }
+
+    return 0;
+}
+
+static PyObject *Array_get__array_interface__(ArrayObject *self, void *closure) {
+    Py_INCREF(self->py_array_interface);
+    return self->py_array_interface;
+}
+
+static PyGetSetDef Array_getsetters[] = {
+    {"__array_interface__", (getter)Array_get__array_interface__,
+                            (setter)NULL, "array interface", NULL},
+    {NULL}
+};
+
+static PyType_Slot ArrayType_slots[] = {
+    {Py_tp_init, (initproc)Array_init},
+    {Py_tp_dealloc, (destructor)Array_dealloc},
+    {Py_tp_doc, "Array interface"},
+    {Py_tp_getset, Array_getsetters},
+    {0, NULL},
+};
+
+static PyType_Spec ArrayType_spec = {
+    .name = "_singlestoredb_accel.Array",
+    .basicsize = sizeof(ArrayObject),
+    .itemsize = 0,
+    .flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
+    .slots = ArrayType_slots,
+};
+
+//
+// End Array
+//
+
 static void read_options(MySQLAccelOptions *options, PyObject *dict) {
     if (!options || !dict) return;
 
@@ -744,14 +890,23 @@ static void read_options(MySQLAccelOptions *options, PyObject *dict) {
         if (PyUnicode_CompareWithASCIIString(key, "results_type") == 0) {
             if (PyUnicode_CompareWithASCIIString(value, "dict") == 0 ||
                 PyUnicode_CompareWithASCIIString(value, "dicts") == 0 ) {
-                options->results_type = MYSQLSV_OUT_DICTS;
+                options->results_type = RESULTS_TYPE_DICTS;
             }
             else if (PyUnicode_CompareWithASCIIString(value, "namedtuple") == 0 ||
                      PyUnicode_CompareWithASCIIString(value, "namedtuples") == 0) {
-                options->results_type = MYSQLSV_OUT_NAMEDTUPLES;
+                options->results_type = RESULTS_TYPE_NAMEDTUPLES;
+            }
+            else if (PyUnicode_CompareWithASCIIString(value, "array") == 0) {
+                options->results_type = RESULTS_TYPE_ARRAY;
+            }
+            else if (PyUnicode_CompareWithASCIIString(value, "dataframe") == 0) {
+                options->results_type = RESULTS_TYPE_DATAFRAME;
+            }
+            else if (PyUnicode_CompareWithASCIIString(value, "arrow") == 0) {
+                options->results_type = RESULTS_TYPE_ARROW;
             }
             else {
-                options->results_type = MYSQLSV_OUT_TUPLES;
+                options->results_type = RESULTS_TYPE_TUPLES;
             }
         } else if (PyUnicode_CompareWithASCIIString(key, "parse_json") == 0) {
             options->parse_json = PyObject_IsTrue(value);
@@ -761,6 +916,52 @@ static void read_options(MySQLAccelOptions *options, PyObject *dict) {
             }
         }
     }
+}
+
+// mysql, for whatever reason, treats 0 as an actual year, but not
+// a leap year
+//
+static int is_leap_year(int year)
+{
+    return (year % 4) == 0 && year != 0 && ((year % 100) != 0 || (year % 400) == 0);
+}
+
+static int days_in_previous_months(int month, int year)
+{
+    static const int previous_days[13] =
+        {
+            -31,
+            0,
+            31,
+            31 + 28,
+            31 + 28 + 31,
+            31 + 28 + 31 + 30,
+            31 + 28 + 31 + 30 + 31,
+            31 + 28 + 31 + 30 + 31 + 30,
+            31 + 28 + 31 + 30 + 31 + 30 + 31,
+            31 + 28 + 31 + 30 + 31 + 30 + 31 + 31,
+            31 + 28 + 31 + 30 + 31 + 30 + 31 + 31 + 30,
+            31 + 28 + 31 + 30 + 31 + 30 + 31 + 31 + 30 + 31,
+            31 + 28 + 31 + 30 + 31 + 30 + 31 + 31 + 30 + 31 + 30,
+        };
+    return previous_days[month] + (month > 2 && is_leap_year(year));
+}
+
+// NOTE: year 0 does not actually exist, but mysql pretends it does (and is NOT
+// a leap year)
+//
+static int leap_years_before(int year)
+{
+    return (year - 1) / 4 - (year - 1) / 100 + (year - 1) / 400;
+}
+
+static int days_in_previous_years(int year)
+{
+    return 365 * year + leap_years_before(year);
+}
+
+static int64_t to_days(int year, int month, int day) {
+    return days_in_previous_years(year) + days_in_previous_months(month, year) + day;
 }
 
 static void raise_exception(
@@ -1225,12 +1426,12 @@ static PyObject *read_row_from_packet(
     int microsecond = 0;
 
     switch (py_state->options.results_type) {
-    case MYSQLSV_OUT_NAMEDTUPLES: {
+    case RESULTS_TYPE_NAMEDTUPLES: {
         if (!py_state->namedtuple) goto error;
         py_result = PyStructSequence_New(py_state->namedtuple);
         break;
         }
-    case MYSQLSV_OUT_DICTS:
+    case RESULTS_TYPE_DICTS:
         py_result = PyDict_New();
         break;
     default:
@@ -1475,10 +1676,10 @@ static PyObject *read_row_from_packet(
         }
 
         switch (py_state->options.results_type) {
-        case MYSQLSV_OUT_NAMEDTUPLES:
+        case RESULTS_TYPE_NAMEDTUPLES:
             PyStructSequence_SetItem(py_result, i, py_item);
             break;
-        case MYSQLSV_OUT_DICTS:
+        case RESULTS_TYPE_DICTS:
             PyDict_SetItem(py_result, py_state->py_names[i], py_item);
             Py_INCREF(py_state->py_names[i]);
             Py_DECREF(py_item);
@@ -1496,6 +1697,658 @@ error:
     goto exit;
 }
 
+static int update_arrays(
+    StateObject *py_state
+) {
+    int rc = 0;
+    int size = 0;
+
+    // If the buffer hasn't been initialized, do it
+    if (!py_state->buffer) {
+        if (!py_state->buffer_n_rows) {
+            py_state->buffer_n_rows = 100;
+        }
+        py_state->buffer = calloc(py_state->n_cols, sizeof(char*));
+        // TODO: Raise Python exception
+        if (!py_state->buffer) goto error;
+    }
+
+    // We haven't hit the end yet
+    else if (py_state->buffer_row_idx < py_state->buffer_n_rows) {
+        goto exit;
+    }
+
+    // If file output is set, purge the current rows and reset
+    // the buffer back to the start
+    else if (py_state->output_file) {
+        // TODO: Write data to file
+        py_state->buffer_row_idx = 0;
+    }
+
+    // We hit the end, extend the buffer
+    else {
+        py_state->buffer_n_rows *= 1.7;
+    }
+
+    for (unsigned long i = 0; i < py_state->n_cols; i++) {
+        switch (py_state->type_codes[i]) {
+        case MYSQL_TYPE_NEWDECIMAL:
+        case MYSQL_TYPE_DECIMAL:
+            size = sizeof(PyObject*);
+            break;
+        case MYSQL_TYPE_TINY:
+            size = sizeof(int8_t);
+            break;
+        case MYSQL_TYPE_SHORT:
+            size = sizeof(int16_t);
+            break;
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_LONG:
+            size = sizeof(int32_t);
+            break;
+        case MYSQL_TYPE_LONGLONG:
+            size = sizeof(int64_t);
+            break;
+        case MYSQL_TYPE_FLOAT:
+        case MYSQL_TYPE_DOUBLE:
+            size = sizeof(double);
+            break;
+        case MYSQL_TYPE_NULL:
+            size = sizeof(PyObject*);
+            break;
+        case MYSQL_TYPE_DATETIME:
+        case MYSQL_TYPE_TIMESTAMP:
+            size = sizeof(int64_t);
+            break;
+        case MYSQL_TYPE_NEWDATE:
+        case MYSQL_TYPE_DATE:
+            size = sizeof(int64_t);
+            break;
+        case MYSQL_TYPE_TIME:
+            size = sizeof(int64_t);
+            break;
+        case MYSQL_TYPE_YEAR:
+            size = sizeof(uint16_t);
+            break;
+        case MYSQL_TYPE_BIT:
+        case MYSQL_TYPE_JSON:
+        case MYSQL_TYPE_TINY_BLOB:
+        case MYSQL_TYPE_MEDIUM_BLOB:
+        case MYSQL_TYPE_LONG_BLOB:
+        case MYSQL_TYPE_BLOB:
+        case MYSQL_TYPE_GEOMETRY:
+        case MYSQL_TYPE_ENUM:
+        case MYSQL_TYPE_SET:
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_STRING:
+            size = sizeof(PyObject*);
+            break;
+        default:
+            PyErr_Format(PyExc_TypeError, "Unknown type code: %ld",
+                         py_state->type_codes[i], NULL);
+            goto error;
+        }
+
+        if (!py_state->buffer[i]) {
+            py_state->buffer[i] = calloc(py_state->buffer_n_rows, size);
+        } else {
+            py_state->buffer[i] = realloc(py_state->buffer[i], py_state->buffer_n_rows * size);
+        }
+
+        // TODO: Raise Python exception
+        if (!py_state->buffer[i]) {
+            goto error;
+        }
+    }
+
+exit:
+    return rc;
+
+error:
+    rc = -1;
+    goto exit;
+}
+
+static PyObject *build_column(
+    StateObject *py_state,
+    long long int col
+) {
+    int rc = 0;
+    PyObject *py_out = NULL;
+    PyObject *py_dict = NULL;
+    PyObject *py_shape = NULL;
+    PyObject *py_typestr = NULL;
+    PyObject *py_data = NULL;
+    PyObject *py_array_args = NULL;
+    PyObject *py_args = NULL;
+    PyObject *py_kwds = NULL;
+    ArrayObject *py_array = NULL;
+
+    py_dict = PyDict_New();
+    if (!py_dict) goto error;
+
+    py_shape = PyTuple_New(1);
+    if (!py_shape) goto error;
+    rc = PyTuple_SetItem(py_shape, 0, PyLong_FromUnsignedLongLong(py_state->n_rows));
+    if (rc) goto error;
+    rc = PyDict_SetItem(py_dict, PyStr.shape, py_shape);
+    if (rc) goto error;
+    Py_DECREF(py_shape);
+
+    switch (py_state->type_codes[col]) {
+    case MYSQL_TYPE_NEWDECIMAL:
+    case MYSQL_TYPE_DECIMAL:
+        py_typestr = PyStr.O;
+        break;
+
+    case MYSQL_TYPE_TINY:
+        py_typestr = (py_state->flags[col] & MYSQL_FLAG_UNSIGNED) ? PyStr.u1 : PyStr.i1;
+        break;
+
+    case MYSQL_TYPE_SHORT:
+        py_typestr = (py_state->flags[col] & MYSQL_FLAG_UNSIGNED) ? PyStr.u2 : PyStr.i2;
+        break;
+
+    case MYSQL_TYPE_INT24:
+    case MYSQL_TYPE_LONG:
+        py_typestr = (py_state->flags[col] & MYSQL_FLAG_UNSIGNED) ? PyStr.u4 : PyStr.i4;
+        break;
+
+    case MYSQL_TYPE_LONGLONG:
+        py_typestr = (py_state->flags[col] & MYSQL_FLAG_UNSIGNED) ? PyStr.u8 : PyStr.i8;
+        break;
+
+    case MYSQL_TYPE_FLOAT:
+        py_typestr = PyStr.f4;
+        break;
+
+    case MYSQL_TYPE_DOUBLE:
+        py_typestr = PyStr.f8;
+        break;
+
+    case MYSQL_TYPE_NULL:
+        py_typestr = PyStr.O;
+        break;
+
+    case MYSQL_TYPE_DATETIME:
+    case MYSQL_TYPE_TIMESTAMP:
+        py_typestr = PyStr.datetime_ns;
+        break;
+
+    case MYSQL_TYPE_NEWDATE:
+    case MYSQL_TYPE_DATE:
+        py_typestr = PyStr.datetime_ns;
+        break;
+
+    case MYSQL_TYPE_TIME:
+        py_typestr = PyStr.datetime_ns;
+        break;
+
+    case MYSQL_TYPE_YEAR:
+        py_typestr = PyStr.u2;
+        break;
+
+    case MYSQL_TYPE_BIT:
+    case MYSQL_TYPE_JSON:
+    case MYSQL_TYPE_TINY_BLOB:
+    case MYSQL_TYPE_MEDIUM_BLOB:
+    case MYSQL_TYPE_LONG_BLOB:
+    case MYSQL_TYPE_BLOB:
+    case MYSQL_TYPE_GEOMETRY:
+    case MYSQL_TYPE_ENUM:
+    case MYSQL_TYPE_SET:
+    case MYSQL_TYPE_VARCHAR:
+    case MYSQL_TYPE_VAR_STRING:
+    case MYSQL_TYPE_STRING:
+        py_typestr = PyStr.O;
+        break;
+
+    default:
+        PyErr_Format(PyExc_TypeError, "Unknown type code: %ld", py_state->type_codes[col], NULL);
+        goto error;
+    }
+
+    if (!py_typestr) goto error;
+
+    rc = PyDict_SetItem(py_dict, PyStr.typestr, py_typestr);
+    if (rc) goto error;
+
+    py_data = PyTuple_New(2);
+    if (!py_data) goto error;
+
+    rc = PyTuple_SetItem(py_data, 0, PyLong_FromUnsignedLongLong((unsigned long long)py_state->buffer[col]));
+    if (rc) goto error;
+    rc = PyTuple_SetItem(py_data, 1, Py_False);
+    if (rc) goto error;
+    Py_INCREF(Py_False);
+    rc = PyDict_SetItem(py_dict, PyStr.data, py_data);
+    if (rc) goto error;
+
+    py_array_args = PyTuple_New(1);
+    if (!py_array_args) goto error;
+    rc = PyTuple_SetItem(py_array_args, 0, py_dict);
+    if (rc) goto error;
+    py_array = (ArrayObject*)PyObject_Call((PyObject*)ArrayType, py_array_args, NULL);
+    if (!py_array) goto error;
+
+    py_args = PyTuple_New(1);
+    if (!py_args) goto error;
+    rc = PyTuple_SetItem(py_args, 0, (PyObject*)py_array);
+    if (rc) goto error;
+    py_kwds = PyDict_New();
+    rc = PyDict_SetItem(py_kwds, PyStr.copy, Py_False);
+    if (rc) goto error;
+    py_out = PyObject_Call(PyFunc.numpy_array, py_args, py_kwds);
+    if (!py_out) goto error;
+
+exit:
+    Py_XDECREF(py_data);
+    Py_XDECREF(py_dict);
+    Py_XDECREF(py_array_args);
+    Py_XDECREF(py_args);
+    Py_XDECREF(py_kwds);
+    return py_out;
+
+error:
+    Py_XDECREF(py_out);
+    py_out = NULL;
+    goto exit;
+}
+
+static PyObject *build_array(
+    StateObject *py_state
+) {
+    int rc = 0;
+    PyObject *py_out = NULL;
+    PyObject *py_dict = NULL;
+    PyObject *py_args = NULL;
+    PyObject *py_list = NULL;
+    PyObject *py_names = NULL;
+    PyObject *py_kwds = NULL;
+
+    // Numpy array
+    if (py_state->options.results_type == RESULTS_TYPE_ARRAY) {
+        py_args = PyTuple_New(1);
+        if (!py_args) goto error;
+
+        py_list = PyList_New(py_state->n_cols);
+        if (!py_list) goto error;
+        PyTuple_SetItem(py_args, 0, py_list);
+
+        py_kwds = PyDict_New();
+        if (!py_kwds) goto error;
+        py_names = PyList_New(py_state->n_cols);
+        if (!py_names) goto error;
+        PyDict_SetItem(py_kwds, PyStr.names, py_names);
+
+        for (unsigned long i = 0; i < py_state->n_cols; i++) {
+            // TODO: Save this list in py_state for reuse
+            PyList_SetItem(py_names, i, py_state->py_names[i]);
+            rc = PyList_SetItem(py_list, i, build_column(py_state, i));
+            if (rc != 0) goto exit;
+        }
+
+        py_out = PyObject_Call(PyFunc.numpy_core_records_fromarrays, py_args, py_kwds);
+    }
+
+    // Dataframe and Arrow Table
+    else {
+        py_dict = PyDict_New();
+        if (!py_dict) goto error;
+
+        for (unsigned long i = 0; i < py_state->n_cols; i++) {
+            rc = PyDict_SetItem(py_dict, py_state->py_names[i], build_column(py_state, i));
+            if (rc != 0) goto exit;
+            Py_INCREF(py_state->py_names[i]);
+        }
+
+        py_args = PyTuple_New(1);
+        if (!py_args) goto error;
+        rc = PyTuple_SetItem(py_args, 0, py_dict);
+        if (rc != 0) goto exit;
+
+        switch (py_state->options.results_type) {
+        case RESULTS_TYPE_DATAFRAME:
+            py_out = PyObject_Call(PyFunc.pandas_DataFrame, py_args, NULL);
+            break;
+
+        case RESULTS_TYPE_ARROW:
+            py_out = PyObject_Call(PyFunc.pyarrow_table, py_args, NULL);
+            break;
+
+            // TODO: If output is parquet, flush the data to disk
+        }
+    }
+
+exit:
+    Py_XDECREF(py_names);
+    Py_XDECREF(py_kwds);
+    Py_XDECREF(py_list);
+    Py_XDECREF(py_dict);
+    Py_XDECREF(py_args);
+    return py_out;
+
+error:
+    Py_XDECREF(py_out);
+    py_out = NULL;
+    goto exit;
+}
+
+static int read_array_row_from_packet(
+    StateObject *py_state,
+    char *data,
+    unsigned long long data_l
+) {
+    int rc = 0;
+    char *out = NULL;
+    unsigned long long out_l = 0;
+    int is_null = 0;
+    PyObject *py_item = NULL;
+    PyObject *py_str = NULL;
+    char *end = NULL;
+    char **arrays = NULL;
+    PyObject *core = NULL;
+    PyObject *records = NULL;
+
+    int sign = 1;
+    int year = 0;
+    int month = 0;
+    int day = 0;
+    int hour = 0;
+    int minute = 0;
+    int second = 0;
+    int microsecond = 0;
+
+    if (!PyMod.numpy) {
+        PyMod.numpy = PyImport_ImportModule("numpy");
+        if (!PyMod.numpy) goto error;
+        //PyConst.numpy_NaT = PyObject_GetAttr(PyMod.numpy, PyStr.NaT);
+        //if (!PyConst.numpy_NaT) goto error;
+        core = PyObject_GetAttr(PyMod.numpy, PyStr.core);
+        if (!core) goto error;
+        records = PyObject_GetAttr(core, PyStr.records);
+        if (!records) goto error;
+        PyFunc.numpy_core_records_fromarrays = PyObject_GetAttr(records, PyStr.fromarrays);
+        if (!PyFunc.numpy_core_records_fromarrays) goto error;
+        PyFunc.numpy_array = PyObject_GetAttr(PyMod.numpy, PyStr.array);
+        if (!PyFunc.numpy_array) goto error;
+        PyFunc.numpy_column_stack = PyObject_GetAttr(PyMod.numpy, PyStr.column_stack);
+        if (!PyFunc.numpy_column_stack) goto error;
+    }
+
+    switch (py_state->options.results_type) {
+    case RESULTS_TYPE_DATAFRAME:
+        if (!PyMod.pandas) {
+            PyMod.pandas = PyImport_ImportModule("pandas");
+            if (!PyMod.pandas) goto error;
+            PyFunc.pandas_DataFrame = PyObject_GetAttr(PyMod.pandas, PyStr.DataFrame);
+            if (!PyFunc.pandas_DataFrame) goto error;
+        }
+        break;
+    case RESULTS_TYPE_ARROW:
+        if (!PyMod.pyarrow) {
+            PyMod.pyarrow = PyImport_ImportModule("pyarrow");
+            if (!PyMod.pyarrow) goto error;
+            PyFunc.pyarrow_table = PyObject_GetAttr(PyMod.pyarrow, PyStr.table);
+            if (!PyFunc.pyarrow_table) goto error;
+        }
+        break;
+    }
+
+    // If we've reached the end of the array buffers, extend them.
+    if ((rc = update_arrays(py_state))) {
+        // TODO: Raise Python exception
+        goto error;
+    }
+
+    arrays = py_state->buffer;
+
+    for (unsigned long i = 0; i < py_state->n_cols; i++) {
+
+        read_length_coded_string(&data, &data_l, &out, &out_l, &is_null);
+        end = &out[out_l];
+
+        switch (py_state->type_codes[i]) {
+        case MYSQL_TYPE_NEWDECIMAL:
+        case MYSQL_TYPE_DECIMAL:
+        {
+            PyObject **loc = ((PyObject**)arrays[i]) + py_state->buffer_row_idx;
+            if (is_null) {
+                *loc = Py_None;
+                Py_INCREF(Py_None);
+            } else {
+                py_str = PyUnicode_Decode(out, out_l, py_state->encodings[i], "strict");
+                if (!py_str) goto error;
+
+                py_item = PyObject_CallFunctionObjArgs(PyFunc.decimal_Decimal, py_str, NULL);
+                Py_CLEAR(py_str);
+                if (!py_item) goto error;
+
+                *loc = py_item;
+            }
+            break;
+        }
+
+        case MYSQL_TYPE_TINY:
+        {
+            uint8_t *loc = ((uint8_t*)arrays[i]) + py_state->buffer_row_idx;
+            if (py_state->flags[i] & MYSQL_FLAG_UNSIGNED) {
+                *loc = (is_null) ? 0 : (uint8_t)strtoull(out, &end, 10);
+            } else {
+                *loc = (is_null) ? INT8_MIN : (int8_t)strtoll(out, &end, 10);
+            }
+            break;
+        }
+
+        case MYSQL_TYPE_SHORT:
+        {
+            uint16_t *loc = ((uint16_t*)arrays[i]) + py_state->buffer_row_idx;
+            if (py_state->flags[i] & MYSQL_FLAG_UNSIGNED) {
+                *loc = (is_null) ? 0 : (uint16_t)strtoull(out, &end, 10);
+            } else {
+                *loc = (is_null) ? INT16_MIN : (int16_t)strtoll(out, &end, 10);
+            }
+            break;
+        }
+
+        case MYSQL_TYPE_INT24:
+        case MYSQL_TYPE_LONG:
+        {
+            uint32_t *loc = ((uint32_t*)arrays[i]) + py_state->buffer_row_idx;
+            if (py_state->flags[i] & MYSQL_FLAG_UNSIGNED) {
+                *loc = (is_null) ? 0 : (uint32_t)strtoull(out, &end, 10);
+            } else {
+                *loc = (is_null) ? INT32_MIN : (int32_t)strtoll(out, &end, 10);
+            }
+            break;
+        }
+
+        case MYSQL_TYPE_LONGLONG:
+        {
+            uint64_t *loc = ((uint64_t*)arrays[i]) + py_state->buffer_row_idx;
+            if (py_state->flags[i] & MYSQL_FLAG_UNSIGNED) {
+                *loc = (is_null) ? 0 : (uint64_t)strtoull(out, &end, 10);
+            } else {
+                *loc = (is_null) ? INT64_MIN : (int64_t)strtoll(out, &end, 10);
+            }
+            break;
+        }
+
+        case MYSQL_TYPE_FLOAT:
+        {
+            float *loc = ((float*)arrays[i]) + py_state->buffer_row_idx;
+            if (is_null) {
+                *loc = (float)py_state->float_nan;
+            } else {
+                *loc = (float)strtod(out, &end);
+            }
+            break;
+        }
+
+        case MYSQL_TYPE_DOUBLE:
+        {
+            double *loc = ((double*)arrays[i]) + py_state->buffer_row_idx;
+            if (is_null) {
+                *loc = (double)py_state->double_nan;
+            } else {
+                *loc = (double)strtod(out, &end);
+            }
+            break;
+        }
+
+        case MYSQL_TYPE_NULL:
+        {
+            PyObject **loc = ((PyObject**)arrays[i]) + py_state->buffer_row_idx;
+            *loc = Py_None;
+            break;
+        }
+
+        case MYSQL_TYPE_DATETIME:
+        case MYSQL_TYPE_TIMESTAMP:
+        {
+            int64_t *loc = ((int64_t*)arrays[i]) + py_state->buffer_row_idx;
+            if (CHECK_ANY_ZERO_DATETIME_STR(out, out_l) ||
+                !CHECK_ANY_DATETIME_STR(out, out_l)) {
+                //*loc = (int64_t)(PyConst.numpy_NaT);
+                *loc = (int64_t)(INT64_MIN);
+                break;
+            }
+            year = CHR2INT4(out); out += 5;
+            month = CHR2INT2(out); out += 3;
+            day = CHR2INT2(out); out += 3;
+            hour = CHR2INT2(out); out += 3;
+            minute = CHR2INT2(out); out += 3;
+            second = CHR2INT2(out); out += 3;
+            microsecond = (IS_DATETIME_MICRO(out, out_l)) ? CHR2INT6(out) :
+                          (IS_DATETIME_MILLI(out, out_l)) ? CHR2INT3(out) * 1e3 : 0;
+            *loc = (int64_t)(((to_days(year, month, day) - EPOCH_TO_DAYS)
+                               * SECONDS_PER_DAY + hour * 3600 + minute * 60 + second)
+                             * 1e9 + microsecond * 1e3);
+            break;
+        }
+
+        case MYSQL_TYPE_NEWDATE:
+        case MYSQL_TYPE_DATE:
+        {
+            int64_t *loc = ((int64_t*)arrays[i]) + py_state->buffer_row_idx;
+            if (CHECK_ZERO_DATE_STR(out, out_l) ||
+                !CHECK_DATE_STR(out, out_l)) {
+                *loc = (int64_t)(INT64_MIN);
+                break;
+            }
+            year = CHR2INT4(out); out += 5;
+            month = CHR2INT2(out); out += 3;
+            day = CHR2INT2(out); out += 3;
+            *loc = (int64_t)((to_days(year, month, day) - EPOCH_TO_DAYS)
+                              * SECONDS_PER_DAY * 1e9);
+            break;
+        }
+
+        case MYSQL_TYPE_TIME:
+        {
+            int64_t *loc = ((int64_t*)arrays[i]) + py_state->buffer_row_idx;
+            sign = CHECK_ANY_TIMEDELTA_STR(out, out_l);
+            if (!sign) {
+                *loc = (int64_t)(INT64_MIN);
+                break;
+            } else if (sign < 0) {
+                out += 1; out_l -= 1;
+            }
+            if (IS_TIMEDELTA1(out, out_l)) {
+                hour = CHR2INT1(out); out += 2;
+                minute = CHR2INT2(out); out += 3;
+                second = CHR2INT2(out); out += 3;
+                microsecond = (IS_TIMEDELTA_MICRO(out, out_l)) ? CHR2INT6(out) :
+                              (IS_TIMEDELTA_MILLI(out, out_l)) ? CHR2INT3(out) * 1e3 : 0;
+            }
+            else if (IS_TIMEDELTA2(out, out_l)) {
+                hour = CHR2INT2(out); out += 3;
+                minute = CHR2INT2(out); out += 3;
+                second = CHR2INT2(out); out += 3;
+                microsecond = (IS_TIMEDELTA_MICRO(out, out_l)) ? CHR2INT6(out) :
+                              (IS_TIMEDELTA_MILLI(out, out_l)) ? CHR2INT3(out) * 1e3 : 0;
+            }
+            else if (IS_TIMEDELTA3(out, out_l)) {
+                hour = CHR2INT3(out); out += 4;
+                minute = CHR2INT2(out); out += 3;
+                second = CHR2INT2(out); out += 3;
+                microsecond = (IS_TIMEDELTA_MICRO(out, out_l)) ? CHR2INT6(out) :
+                              (IS_TIMEDELTA_MILLI(out, out_l)) ? CHR2INT3(out) * 1e3 : 0;
+            }
+            *loc = (int64_t)((hour * 3600 + minute * 60 + second)
+                             * 1e9 + microsecond * 1e3) * sign;
+            break;
+        }
+
+        case MYSQL_TYPE_YEAR:
+        {
+            uint16_t *loc = ((uint16_t*)arrays[i]) + py_state->buffer_row_idx;
+            if (out_l == 0) {
+                *loc = 0;
+                break;
+            }
+            end = &out[out_l];
+            *loc = (uint16_t)strtoul(out, &end, 10);
+            break;
+        }
+
+        case MYSQL_TYPE_BIT:
+        case MYSQL_TYPE_JSON:
+        case MYSQL_TYPE_TINY_BLOB:
+        case MYSQL_TYPE_MEDIUM_BLOB:
+        case MYSQL_TYPE_LONG_BLOB:
+        case MYSQL_TYPE_BLOB:
+        case MYSQL_TYPE_GEOMETRY:
+        case MYSQL_TYPE_ENUM:
+        case MYSQL_TYPE_SET:
+        case MYSQL_TYPE_VARCHAR:
+        case MYSQL_TYPE_VAR_STRING:
+        case MYSQL_TYPE_STRING:
+        {
+            PyObject **loc = ((PyObject**)arrays[i]) + py_state->buffer_row_idx;
+
+            if (!py_state->encodings[i]) {
+                py_item = PyBytes_FromStringAndSize(out, out_l);
+                if (!py_item) goto error;
+                break;
+            }
+
+            py_item = PyUnicode_Decode(out, out_l, py_state->encodings[i], "strict");
+            if (!py_item) goto error;
+
+            // Parse JSON string.
+            if (py_state->type_codes[i] == MYSQL_TYPE_JSON && py_state->options.parse_json) {
+                py_str = py_item;
+                py_item = PyObject_CallFunctionObjArgs(PyFunc.json_loads, py_str, NULL);
+                Py_CLEAR(py_str);
+                if (!py_item) goto error;
+            }
+
+            *loc = py_item;
+
+            break;
+        }
+
+        default:
+            PyErr_Format(PyExc_TypeError, "Unknown type code: %ld",
+                         py_state->type_codes[i], NULL);
+            goto error;
+        }
+    }
+
+    py_state->buffer_row_idx++;
+
+exit:
+    Py_XDECREF(core);
+    Py_XDECREF(records);
+    return rc;
+
+error:
+    rc = -1;
+    goto exit;
+}
+
 static PyObject *read_rowdata_packet(PyObject *self, PyObject *args, PyObject *kwargs) {
     int rc = 0;
     StateObject *py_state = NULL;
@@ -1503,13 +2356,13 @@ static PyObject *read_rowdata_packet(PyObject *self, PyObject *args, PyObject *k
     PyObject *py_unbuffered = NULL;
     PyObject *py_out = NULL;
     PyObject *py_next_seq_id = NULL;
-    PyObject *py_zero = PyLong_FromUnsignedLong(0);
     unsigned long long requested_n_rows = 0;
     unsigned long long row_idx = 0;
     char *keywords[] = {"result", "unbuffered", "size", NULL};
 
     // Parse function args.
-    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|K", keywords, &py_res, &py_unbuffered, &requested_n_rows)) {
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO|K", keywords,
+                                     &py_res, &py_unbuffered, &requested_n_rows)) {
         goto error;
     }
 
@@ -1517,7 +2370,6 @@ static PyObject *read_rowdata_packet(PyObject *self, PyObject *args, PyObject *k
         PyObject *unbuffered_active = PyObject_GetAttr(py_res, PyStr.unbuffered_active);
         if (!unbuffered_active || !PyObject_IsTrue(unbuffered_active)) {
             Py_XDECREF(unbuffered_active);
-            Py_XDECREF(py_zero);
             Py_INCREF(Py_None);
             return Py_None;
          }
@@ -1591,16 +2443,22 @@ static PyObject *read_rowdata_packet(PyObject *self, PyObject *args, PyObject *k
         py_state->n_rows++;
         py_state->n_rows_in_batch++;
 
-        py_row = read_row_from_packet(py_state, data, data_l);
-        if (!py_row) { Py_CLEAR(py_buff); goto error; }
+        switch (py_state->options.results_type) {
+        case RESULTS_TYPE_DATAFRAME:
+        case RESULTS_TYPE_ARRAY:
+        case RESULTS_TYPE_ARROW:
+            rc = read_array_row_from_packet(py_state, data, data_l);
+            if (rc != 0) { Py_CLEAR(py_buff); goto error; }
+            break;
 
-        //if (requested_n_rows == 1) {
-        //    rc = PyList_SetItem(py_state->py_rows, 0, py_row);
-        //} else {
+        default:
+            py_row = read_row_from_packet(py_state, data, data_l);
+            if (!py_row) { Py_CLEAR(py_buff); goto error; }
+
             rc = PyList_Append(py_state->py_rows, py_row);
             Py_DECREF(py_row);
-        //}
-        if (rc != 0) { Py_CLEAR(py_buff); goto error; }
+            if (rc != 0) { Py_CLEAR(py_buff); goto error; }
+        }
 
         row_idx++;
 
@@ -1629,24 +2487,52 @@ exit:
             Py_CLEAR(py_state);
         }
         else {
-            py_out = (requested_n_rows == 1) ?
-                     PyList_GetItem(py_state->py_rows, 0) : py_state->py_rows;
+            switch (py_state->options.results_type) {
+            case RESULTS_TYPE_ARRAY:
+            case RESULTS_TYPE_DATAFRAME:
+            case RESULTS_TYPE_ARROW:
+                if (py_state->buffer) {
+                    py_out = build_array(py_state);
+                    if (!py_out) goto error;
+                } else {
+                    py_out = Py_None;
+                }
+                break;
+            default:
+                py_out = (requested_n_rows == 1) ?
+                         PyList_GetItem(py_state->py_rows, 0) : py_state->py_rows;
+            }
             Py_XINCREF(py_out);
         }
     }
     else {
-        py_out = py_state->py_rows;
+        switch (py_state->options.results_type) {
+        case RESULTS_TYPE_ARRAY:
+        case RESULTS_TYPE_DATAFRAME:
+        case RESULTS_TYPE_ARROW:
+            if (py_state->buffer) {
+                py_out = build_array(py_state);
+                if (!py_out) goto error;
+            } else {
+                py_out = Py_None;
+            }
+            break;
+        default:
+            py_out = py_state->py_rows;
+        }
         Py_INCREF(py_out);
+
         PyObject *py_n_rows = PyLong_FromSsize_t(py_state->n_rows);
         PyObject_SetAttr(py_res, PyStr.affected_rows, (py_n_rows) ? py_n_rows : Py_None);
         Py_XDECREF(py_n_rows);
+
         if (py_state->is_eof) {
             PyObject_DelAttr(py_res, PyStr._state);
             Py_CLEAR(py_state);
         }
     }
 
-    Py_XDECREF(py_zero);
+    PyObject_SetAttr(py_res, PyStr.rows, py_out);
 
     return py_out;
 
@@ -1674,6 +2560,11 @@ PyMODINIT_FUNC PyInit__singlestoredb_accel(void) {
 
     StateType = (PyTypeObject*)PyType_FromSpec(&StateType_spec);
     if (StateType == NULL || PyType_Ready(StateType) < 0) {
+        return NULL;
+    }
+
+    ArrayType = (PyTypeObject*)PyType_FromSpec(&ArrayType_spec);
+    if (ArrayType == NULL || PyType_Ready(ArrayType) < 0) {
         return NULL;
     }
 
@@ -1712,25 +2603,50 @@ PyMODINIT_FUNC PyInit__singlestoredb_accel(void) {
     PyStr._result = PyUnicode_FromString("_result");
     PyStr._next_seq_id = PyUnicode_FromString("_next_seq_id");
     PyStr.rows = PyUnicode_FromString("rows");
+    PyStr.NaT = PyUnicode_FromString("NaT");
+    PyStr.table = PyUnicode_FromString("table");
+    PyStr.DataFrame = PyUnicode_FromString("DataFrame");
+    PyStr.array = PyUnicode_FromString("array");
+    PyStr.column_stack = PyUnicode_FromString("column_stack");
+    PyStr.O = PyUnicode_FromString("|O");
+    PyStr.u1 = PyUnicode_FromString("<u1");
+    PyStr.u2 = PyUnicode_FromString("<u2");
+    PyStr.u4 = PyUnicode_FromString("<u4");
+    PyStr.u8 = PyUnicode_FromString("<u8");
+    PyStr.i1 = PyUnicode_FromString("<i1");
+    PyStr.i2 = PyUnicode_FromString("<i2");
+    PyStr.i4 = PyUnicode_FromString("<i4");
+    PyStr.i8 = PyUnicode_FromString("<i8");
+    PyStr.f4 = PyUnicode_FromString("<f4");
+    PyStr.f8 = PyUnicode_FromString("<f8");
+    PyStr.datetime_ns = PyUnicode_FromString("<datetime64[ns]");
+    PyStr.shape = PyUnicode_FromString("shape");
+    PyStr.typestr = PyUnicode_FromString("typestr");
+    PyStr.data = PyUnicode_FromString("data");
+    PyStr.copy = PyUnicode_FromString("copy");
+    PyStr.core = PyUnicode_FromString("core");
+    PyStr.records = PyUnicode_FromString("records");
+    PyStr.fromarrays = PyUnicode_FromString("fromarrays");
+    PyStr.names = PyUnicode_FromString("names");
 
-    PyObject *decimal_mod = PyImport_ImportModule("decimal");
-    if (!decimal_mod) goto error;
-    PyObject *datetime_mod = PyImport_ImportModule("datetime");
-    if (!datetime_mod) goto error;
-    PyObject *json_mod = PyImport_ImportModule("json");
-    if (!json_mod) goto error;
+    PyMod.decimal = PyImport_ImportModule("decimal");
+    if (!PyMod.decimal) goto error;
+    PyMod.datetime = PyImport_ImportModule("datetime");
+    if (!PyMod.datetime) goto error;
+    PyMod.json = PyImport_ImportModule("json");
+    if (!PyMod.json) goto error;
 
-    PyFunc.decimal_Decimal = PyObject_GetAttr(decimal_mod, PyStr.Decimal);
+    PyFunc.decimal_Decimal = PyObject_GetAttr(PyMod.decimal, PyStr.Decimal);
     if (!PyFunc.decimal_Decimal) goto error;
-    PyFunc.datetime_date = PyObject_GetAttr(datetime_mod, PyStr.date);
+    PyFunc.datetime_date = PyObject_GetAttr(PyMod.datetime, PyStr.date);
     if (!PyFunc.datetime_date) goto error;
-    PyFunc.datetime_timedelta = PyObject_GetAttr(datetime_mod, PyStr.timedelta);
+    PyFunc.datetime_timedelta = PyObject_GetAttr(PyMod.datetime, PyStr.timedelta);
     if (!PyFunc.datetime_timedelta) goto error;
-    PyFunc.datetime_time = PyObject_GetAttr(datetime_mod, PyStr.time);
+    PyFunc.datetime_time = PyObject_GetAttr(PyMod.datetime, PyStr.time);
     if (!PyFunc.datetime_time) goto error;
-    PyFunc.datetime_datetime = PyObject_GetAttr(datetime_mod, PyStr.datetime);
+    PyFunc.datetime_datetime = PyObject_GetAttr(PyMod.datetime, PyStr.datetime);
     if (!PyFunc.datetime_datetime) goto error;
-    PyFunc.json_loads = PyObject_GetAttr(json_mod, PyStr.loads);
+    PyFunc.json_loads = PyObject_GetAttr(PyMod.json, PyStr.loads);
     if (!PyFunc.json_loads) goto error;
 
     return PyModule_Create(&_singlestoredb_accelmodule);

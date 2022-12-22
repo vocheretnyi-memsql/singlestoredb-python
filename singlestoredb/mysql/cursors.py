@@ -442,6 +442,64 @@ class CursorSV(Cursor):
     """Cursor class for C extension."""
 
 
+class ArrayCursorMixin:
+
+    def _do_get_result(self):
+        import numpy as np
+
+        super(ArrayCursorMixin, self)._do_get_result()
+        fields = []
+        if self._description:
+            for f in self._result.fields:
+                name = f.name
+                if name in fields:
+                    name = f.table_name + '.' + name
+                fields.append(name)
+            self._fields = fields
+
+        if fields and self._rows:
+            self._rows = np.core.records.fromrecords(self._rows, names=fields)
+
+
+class DataFrameCursorMixin:
+
+    def _do_get_result(self):
+        import pandas as pd
+
+        super(DataFrameCursorMixin, self)._do_get_result()
+        fields = []
+        if self._description:
+            for f in self._result.fields:
+                name = f.name
+                if name in fields:
+                    name = f.table_name + '.' + name
+                fields.append(name)
+            self._fields = fields
+
+        if fields and self._rows:
+            self._rows = pd.DataFrame(self._rows, columns=fields)
+
+
+class ArrowCursorMixin:
+
+    def _do_get_result(self):
+        import pandas as pd
+        import pyararow as pa
+
+        super(DataFrameCursorMixin, self)._do_get_result()
+        fields = []
+        if self._description:
+            for f in self._result.fields:
+                name = f.name
+                if name in fields:
+                    name = f.table_name + '.' + name
+                fields.append(name)
+            self._fields = fields
+
+        if fields and self._rows:
+            self._rows = pa.Table.from_pandas(pd.DataFrame(self._rows, columns=fields))
+
+
 class DictCursorMixin:
     # You can override this to use OrderedDict or other dict-like types.
     dict_type = dict
@@ -472,6 +530,30 @@ class DictCursor(DictCursorMixin, Cursor):
 
 class DictCursorSV(Cursor):
     """A cursor which returns results as a dictionary for C extension."""
+
+
+class ArrayCursor(ArrayCursorMixin, Cursor):
+    """A cursor which returns results as a numpy array."""
+
+
+class ArrayCursorSV(Cursor):
+    """A cursor which returns results as a numpy array for C extension."""
+
+
+class DataFrameCursor(DataFrameCursorMixin, Cursor):
+    """A cursor which returns results as a pandas DataFrame."""
+
+
+class DataFrameCursorSV(Cursor):
+    """A cursor which returns results as a pandas DataFrame for C extension."""
+
+
+class ArrowCursor(ArrowCursorMixin, Cursor):
+    """A cursor which returns results as a pyarrow Table."""
+
+
+class ArrowCursorSV(Cursor):
+    """A cursor which returns results as a pyarrow Table for C extension."""
 
 
 class NamedtupleCursorMixin:
@@ -711,3 +793,27 @@ class SSNamedtupleCursor(NamedtupleCursorMixin, SSCursor):
 
 class SSNamedtupleCursorSV(SSCursorSV):
     """An unbuffered cursor for the C extension, which returns results as a named tuple"""
+
+
+class SSArrayCursor(ArrayCursorMixin, SSCursor):
+    """An unbuffered cursor, which returns results as a numpy array"""
+
+
+class SSArrayCursorSV(SSCursorSV):
+    """An unbuffered cursor for the C extension, which returns a numpy array"""
+
+
+class SSDataFrameCursor(DataFrameCursorMixin, SSCursor):
+    """An unbuffered cursor, which returns results as a pandas DataFrame"""
+
+
+class SSDataFrameCursorSV(SSCursorSV):
+    """An unbuffered cursor for the C extension, which returns a pandas DataFrame"""
+
+
+class SSArrowCursor(ArrowCursorMixin, SSCursor):
+    """An unbuffered cursor, which returns results as a pyarrow Table"""
+
+
+class SSArrowCursorSV(SSCursorSV):
+    """An unbuffered cursor for the C extension, which returns a pyarrow Table"""

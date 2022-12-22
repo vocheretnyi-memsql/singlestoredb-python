@@ -29,12 +29,24 @@ from .cursors import (
     DictCursorSV,
     NamedtupleCursor,
     NamedtupleCursorSV,
+    ArrayCursor,
+    ArrayCursorSV,
+    DataFrameCursor,
+    DataFrameCursorSV,
+    ArrowCursor,
+    ArrowCursorSV,
     SSCursor,
     SSCursorSV,
     SSDictCursor,
     SSDictCursorSV,
     SSNamedtupleCursor,
     SSNamedtupleCursorSV,
+    SSArrayCursor,
+    SSArrayCursorSV,
+    SSDataFrameCursor,
+    SSDataFrameCursorSV,
+    SSArrowCursor,
+    SSArrowCursorSV,
 )
 from .optionfile import Parser
 from .protocol import (
@@ -419,6 +431,12 @@ class Connection(BaseConnection):
                 self.cursorclass = DictCursor
             elif 'namedtuple' in self.results_type:
                 self.cursorclass = NamedtupleCursor
+            elif 'array' in self.results_type:
+                self.cursorclass = ArrayCursor
+            elif 'dataframe' in self.results_type:
+                self.cursorclass = DataFrameCursor
+            elif 'arrow' in self.results_type:
+                self.cursorclass = ArrowCursor
             else:
                 self.cursorclass = Cursor
         else:
@@ -426,6 +444,12 @@ class Connection(BaseConnection):
                 self.cursorclass = SSDictCursor
             elif 'namedtuple' in self.results_type:
                 self.cursorclass = SSNamedtupleCursor
+            elif 'array' in self.results_type:
+                self.cursorclass = SSArrayCursor
+            elif 'dataframe' in self.results_type:
+                self.cursorclass = SSDataFrameCursor
+            elif 'arrow' in self.results_type:
+                self.cursorclass = SSArrowCursor
             else:
                 self.cursorclass = SSCursor
 
@@ -463,6 +487,24 @@ class Connection(BaseConnection):
             elif self.cursorclass is SSNamedtupleCursor:
                 self.cursorclass = SSNamedtupleCursorSV
                 self.results_type = 'namedtuples'
+            elif self.cursorclass is ArrayCursor:
+                self.cursorclass = ArrayCursorSV
+                self.results_type = 'array'
+            elif self.cursorclass is SSArrayCursor:
+                self.cursorclass = SSArrayCursorSV
+                self.results_type = 'array'
+            elif self.cursorclass is DataFrameCursor:
+                self.cursorclass = DataFrameCursorSV
+                self.results_type = 'dataframe'
+            elif self.cursorclass is SSDataFrameCursor:
+                self.cursorclass = SSDataFrameCursorSV
+                self.results_type = 'dataframe'
+            elif self.cursorclass is ArrowCursor:
+                self.cursorclass = ArrowCursorSV
+                self.results_type = 'arrow'
+            elif self.cursorclass is SSArrowCursor:
+                self.cursorclass = SSArrowCursorSV
+                self.results_type = 'arrow'
 
         self._result = None
         self._affected_rows = 0
@@ -707,9 +749,18 @@ class Connection(BaseConnection):
             return "'%s'" % (s.replace(b"'", b"''").decode('ascii', 'surrogateescape'),)
         return converters.escape_bytes(s)
 
-    def cursor(self):
+    def cursor(self, parallel: bool = False):
         """Create a new cursor to execute queries with."""
-        return self.cursorclass(self)
+        out = self.cursorclass(self)
+        if parallel:
+            if self.results_type != 'arrow':
+                raise ValueError(
+                    'parallel readers currently only work with '
+                    'connections with results_type="arrow"',
+                )
+            from ..connection import Parallelizer
+            return Parallelizer(out)
+        return out
 
     # The following methods are INTERNAL USE ONLY (called from Cursor)
     def query(self, sql, unbuffered=False):

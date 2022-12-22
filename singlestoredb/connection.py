@@ -1,7 +1,9 @@
 #!/usr/bin/env python
 """SingleStoreDB connections and cursors."""
 import abc
+import glob
 import inspect
+import os
 import re
 import warnings
 import weakref
@@ -101,6 +103,11 @@ def cast_bool_param(val: Any) -> bool:
     raise ValueError('Unrecognized value for bool: {}'.format(val))
 
 
+def connection_parameters() -> List[str]:
+    """Return a list of valid parameter names for a connection."""
+    return list(inspect.getfullargspec(connect).args)
+
+
 def build_params(**kwargs: Any) -> Dict[str, Any]:
     """
     Construct connection parameters from given URL and arbitrary parameters.
@@ -120,7 +127,7 @@ def build_params(**kwargs: Any) -> Dict[str, Any]:
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     # Set known parameters
-    for name in inspect.getfullargspec(connect).args:
+    for name in connection_parameters():
         if name == 'conv':
             out[name] = kwargs.get(name, None)
         elif name == 'results_format':  # deprecated
@@ -1039,7 +1046,10 @@ class Connection(metaclass=abc.ABCMeta):
 
     def __init__(self, **kwargs: Any):
         """Call :func:`singlestoredb.connect` instead."""
-        self.connection_params: Dict[str, Any] = kwargs
+        self.connection_params: Dict[str, Any] = {
+            k: v for k, v in kwargs.items()
+            if k in connection_parameters()
+        }
         self.errorhandler = None
         self._results_type: str = kwargs.get('results_type', None) or 'tuples'
 
@@ -1075,6 +1085,10 @@ class Connection(metaclass=abc.ABCMeta):
 
         # For backwards compatibility with SQLAlchemy package
         self._driver = Driver(self.driver)
+
+    def copy(self) -> 'Connection':
+        """Return a new connection using the same connection paramaters."""
+        return connect(**self.connection_params)
 
     @classmethod
     def _convert_params(
@@ -1128,18 +1142,29 @@ class Connection(metaclass=abc.ABCMeta):
             cur.execute(oper, params)
             if not re.match(r'^\s*(select|show|call|echo)\s+', oper, flags=re.I):
                 return []
-            out = list(cur.fetchall())
-            if not out:
+            out = cur.fetchall()
+            if len(out) == 0 or not cur.description:
                 return []
-            if isinstance(out, DataFrame):
-                out = out.to_dict(orient='records')
-            elif isinstance(out[0], (tuple, list)):
-                if cur.description:
-                    names = [x[0] for x in cur.description]
-                    if fix_names:
-                        names = [under2camel(str(x).replace(' ', '')) for x in names]
-                    out = [{k: v for k, v in zip(names, row)} for row in out]
-            return out
+            names = [x[0] for x in cur.description]
+            if fix_names:
+                names = [under2camel(str(x).replace(' ', '')) for x in names]
+            if hasattr(out, 'to_dict'):
+                out.columns = names  # type: ignore
+                out = out.to_dict(orient='records')  # type: ignore
+            elif hasattr(out, 'to_pandas'):
+                out = out.to_pandas()  # type: ignore
+                out.columns = names  # type: ignore
+                out = out.to_dict(orient='records')  # type: ignore
+            elif isinstance(out, (list, tuple)) and \
+                    'array' in type(out[0]).__name__.lower():
+                out = [{k: v for k, v in zip(names, row)} for row in out]
+                for row in out:
+                    for k, v in row.items():
+                        if hasattr(v, 'as_py'):
+                            row[k] = v.as_py()
+            elif isinstance(out, (list, tuple)) and isinstance(out[0], (tuple, list)):
+                out = [{k: v for k, v in zip(names, row)} for row in out]
+            return out  # type: ignore
 
     @abc.abstractmethod
     def close(self) -> None:
@@ -1157,7 +1182,7 @@ class Connection(metaclass=abc.ABCMeta):
         raise NotImplementedError
 
     @abc.abstractmethod
-    def cursor(self) -> Cursor:
+    def cursor(self, parallel: bool = False) -> Cursor:
         """
         Create a new cursor object.
 
@@ -1253,6 +1278,186 @@ class Connection(metaclass=abc.ABCMeta):
 
 
 #
+# WARNING: THIS MUST BE IMPORTABLE FROM __main__!!!
+#
+def _execute_partition(
+    connection_params: Dict[str, Any],
+    outdir: str,
+    table: str,
+    partition: int,
+) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    with connect(**connection_params) as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                f'SELECT * FROM :: `{table}` '
+                f'WHERE partition_id() = {partition}',
+            )
+            # TODO: Fetches could be done with fetchmany in smaller batches
+            pq.write_table(
+                cur.fetchall(),
+                pa.OSFile(
+                    os.path.join(
+                        outdir,
+                        f'partition-{partition}.parquet',
+                    ), 'wb',
+                ),
+                compression='none', write_statistics=False,
+            )
+
+
+class Parallelizer(Cursor):
+    """
+    Parallelize a cursor
+
+    This is a wrapper class that emulates a Cursor class and executes
+    queries with parallel readers. It does not support everything that
+    a normal cursor does since it uses files on disk to buffer the
+    results of a query.
+
+    Examples
+    --------
+    >>> with connect('...', results_type='arrow') as conn:
+    ...     with conn.cursor(parallel=True) as cur:
+    ...         cur.execute('select * from mytable')
+    ...         for item in cur.fetchmany(10):
+    ...             print(item)
+
+    """
+
+    def __init__(self, cursor: 'Cursor'):
+        import tempfile
+        self._tmpdir = tempfile.TemporaryDirectory()
+        self._cursor = cursor
+        self._table = f'_{id(self)}'
+        try:
+            self._n_partitions = int(
+                self.connection._iquery(
+                    'SELECT num_partitions FROM information_schema.DISTRIBUTED_DATABASES '
+                    'WHERE database_name = database()',
+                )[0]['NumPartitions'],
+            )
+        except IndexError:
+            raise exceptions.ProgrammingError(msg='no database selected')
+        self._iter: Iterator[Any] = iter([])
+
+    @property
+    def connection(self) -> Connection:
+        out = self._cursor.connection
+        if out is None:
+            raise ValueError('cursor has no associated connection')
+        return out
+
+    def execute(
+        self, query: str,
+        args: Optional[Union[Sequence[Any], Dict[str, Any], Any]] = None,
+    ) -> int:
+        from multiprocessing import Pool
+        self._cursor.execute(f'CREATE RESULT TABLE `{self._table}` AS {query}', args)
+        # TODO: This could be more advanced by running in a background thread
+        #       and returning immediately. The output iterator would then have
+        #       to know when the results could be read from the output files.
+        with Pool(processes=self._n_partitions) as p:
+            p.starmap(
+                _execute_partition,
+                [(
+                    self.connection.connection_params,
+                    self._tmpdir.name, self._table, x,
+                )
+                    for x in range(self._n_partitions)],
+            )
+        self._iter = iter(self)
+        # TODO: How to compute?
+        return 0
+
+    def executemany(
+        self, query: str,
+        args: Optional[Sequence[Union[Sequence[Any], Dict[str, Any], Any]]] = None,
+    ) -> int:
+        raise NotImplementedError
+
+    def fetchone(self) -> Optional[Result]:
+        return next(self._iter)
+
+    def fetchmany(self, size: Optional[int] = None) -> Result:
+        out = []
+        for _ in range(size or 1):
+            item = next(self._iter)
+            if item is None:
+                break
+            out.append(item)
+        return out
+
+    def fetchall(self) -> Result:
+        # TODO: This would be much more efficient to just read the parquet
+        #       files directly and convert to a DataFrame.
+        # out = []
+        # while True:
+        #     item = next(self._iter)
+        #     if item is None:
+        #         break
+        #     out.append(item)
+        # return out
+        import pandas as pd
+        return list(
+            pd.read_parquet(
+                self._tmpdir.name, engine='fastparquet',
+            ).itertuples(index=False, name='Row'),
+        )
+
+    def __iter__(self) -> Any:
+        return self
+
+    def next(self) -> Optional[Result]:
+        import pyarrow.parquet as pq
+        for f in glob.glob(os.path.join(self._tmpdir.name, '*.parquet')):
+            for df in pq.ParquetFile(f, memory_map=True).iter_batches():
+                for tup in df.to_pandas().itertuples(index=False, name='Row'):
+                    return tup
+
+        self._cursor.execute(f'DROP RESULT TABLE `{self._table}`')
+        self._iter = iter([])
+
+        while True:
+            return None
+
+    __next__ = next
+
+    def callproc(
+        self, name: str,
+        params: Optional[Sequence[Any]] = None,
+    ) -> None:
+        raise NotImplementedError
+
+    def close(self) -> None:
+        self._cursor.close()
+
+    @property
+    def description(self) -> Optional[List[Description]]:
+        return self._cursor.description
+
+    def is_connected(self) -> bool:
+        return self._cursor.is_connected()
+
+    def nextset(self) -> Optional[bool]:
+        raise NotImplementedError
+
+    @property
+    def rownumber(self) -> Optional[int]:
+        return self._cursor.rownumber
+
+    def scroll(self, value: int, mode: str = 'relative') -> None:
+        raise NotImplementedError
+
+    def setinputsizes(self, sizes: Sequence[int]) -> None:
+        raise NotImplementedError
+
+    def setoutputsize(self, size: int, column: Optional[str] = None) -> None:
+        raise NotImplementedError
+
+
+#
 # NOTE: When adding parameters to this function, you should always
 #       make the value optional with a default of None. The options
 #       processing framework will fill in the default value based
@@ -1327,7 +1532,8 @@ def connect(
     autocommit : bool, optional
         Enable autocommits
     results_type : str, optional
-        The form of the query results: tuples, namedtuples, dicts
+        The form of the query results: 'tuples', 'namedtuples', 'dicts', 'array' (numpy),
+        'dataframe' (pandas), or 'arrow'
     results_format : str, optional
         Deprecated. This option has been renamed to results_type.
 
