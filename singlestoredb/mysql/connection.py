@@ -753,11 +753,6 @@ class Connection(BaseConnection):
         """Create a new cursor to execute queries with."""
         out = self.cursorclass(self)
         if parallel:
-            if self.results_type != 'arrow':
-                raise ValueError(
-                    'parallel readers currently only work with '
-                    'connections with results_type="arrow"',
-                )
             from ..connection import Parallelizer
             return Parallelizer(out)
         return out

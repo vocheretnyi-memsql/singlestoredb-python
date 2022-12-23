@@ -1288,7 +1288,9 @@ def _execute_partition(
 ) -> None:
     import pyarrow as pa
     import pyarrow.parquet as pq
-    with connect(**connection_params) as conn:
+    params = dict(connection_params)
+    params['results_type'] = 'arrow'
+    with connect(**params) as conn:
         with conn.cursor() as cur:
             cur.execute(
                 f'SELECT * FROM :: `{table}` '
@@ -1318,7 +1320,7 @@ class Parallelizer(Cursor):
 
     Examples
     --------
-    >>> with connect('...', results_type='arrow') as conn:
+    >>> with connect('...') as conn:
     ...     with conn.cursor(parallel=True) as cur:
     ...         cur.execute('select * from mytable')
     ...         for item in cur.fetchmany(10):
