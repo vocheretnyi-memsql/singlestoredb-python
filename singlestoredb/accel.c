@@ -80,6 +80,57 @@
 #define MYSQLSV_OPTION_BIT_TYPE_BYTES 0
 #define MYSQLSV_OPTION_BIT_TYPE_INT 1
 
+//
+// !! MUST BE KEPT IN SYNC WITH singlestoredb/ext_func/dtypes.py!!!
+//
+#define DATATYPE_BOOL 0
+#define DATATYPE_BOOLEAN 0
+#define DATATYPE_BIT 1
+#define DATATYPE_TINYINT 2
+#define DATATYPE_UNSIGNED_TINYINT 3
+#define DATATYPE_SMALLINT 4
+#define DATATYPE_UNSIGNED_SMALLINT 5
+#define DATATYPE_MEDIUMINT 6
+#define DATATYPE_UNSIGNED_MEDIUMINT 7
+#define DATATYPE_INT 8
+#define DATATYPE_INTEGER 8
+#define DATATYPE_UNSIGNED_INT 9
+#define DATATYPE_UNSIGNED_INTEGER 9
+#define DATATYPE_BIGINT 10
+#define DATATYPE_UNSIGNED_BIGINT 11
+#define DATATYPE_FLOAT 12
+#define DATATYPE_DOUBLE 13
+#define DATATYPE_REAL 13
+#define DATATYPE_DECIMAL 14
+#define DATATYPE_DEC 14
+#define DATATYPE_FIXED 14
+#define DATATYPE_NUMERIC 14
+#define DATATYPE_DATE 15
+#define DATATYPE_TIME 16
+#define DATATYPE_TIME_6 17
+#define DATATYPE_DATETIME 18
+#define DATATYPE_DATETIME_6 19
+#define DATATYPE_TIMESTAMP 20
+#define DATATYPE_TIMESTAMP_6 21
+#define DATATYPE_YEAR 22
+#define DATATYPE_CHAR 23
+#define DATATYPE_VARCHAR 24
+#define DATATYPE_LONGTEXT 25
+#define DATATYPE_MEDIUMTEXT 26
+#define DATATYPE_TEXT 27
+#define DATATYPE_TINYTEXT 28
+#define DATATYPE_BINARY 29
+#define DATATYPE_VARBINARY 30
+#define DATATYPE_LONGBLOB 31
+#define DATATYPE_MEDIUMBLOB 32
+#define DATATYPE_BLOB 33
+#define DATATYPE_TINYBLOB 34
+#define DATATYPE_JSON 35
+#define DATATYPE_GEOGRAPHYPOINT 36
+#define DATATYPE_GEOGRAPHY 37
+#define DATATYPE_ARRAY 101
+#define DATATYPE_RECORD 102
+
 #define CHR2INT1(x) ((x)[1] - '0')
 #define CHR2INT2(x) ((((x)[0] - '0') * 10) + ((x)[1] - '0'))
 #define CHR2INT3(x) ((((x)[0] - '0') * 1e2) + (((x)[1] - '0') * 10) + ((x)[2] - '0'))
@@ -300,6 +351,8 @@
 #define IS_TIMEDELTA_MILLI(s, s_l) ((s_l) == 11 || (s_l) == 12 || (s_l) == 13)
 #define IS_TIMEDELTA_MICRO(s, s_l) ((s_l) == 14 || (s_l) == 15 || (s_l) == 16)
 
+#define CHECKRC(x) if ((x) < 0) goto error;
+
 typedef struct {
     int results_type;
     int parse_json;
@@ -316,11 +369,13 @@ char *PyUnicode_AsUTF8(PyObject *unicode) {
     char *str = NULL;
     Py_ssize_t str_l = 0;
     if (PyBytes_AsStringAndSize(bytes, &str, &str_l) < 0) {
-	return NULL;
+        Py_DECREF(bytes);
+        return NULL;
     }
 
     char *out = calloc(str_l + 1, 1);
     memcpy(out, str, str_l);
+    Py_DECREF(bytes);
     return out;
 }
 
@@ -1659,15 +1714,641 @@ error:
     goto exit;
 }
 
+static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs) {
+    PyObject *py_data = NULL;
+    PyObject *py_out = NULL;
+    PyObject *py_row = NULL;
+    PyObject *py_colspec = NULL;
+    PyObject *py_colspec_iter = NULL;
+    PyObject *py_cspec = NULL;
+    PyObject *py_ctype = NULL;
+    PyObject *py_str = NULL;
+    PyObject *py_blob = NULL;
+    Py_ssize_t length = 0;
+    uint64_t row_id = 0;
+    uint8_t is_null = 0;
+    int8_t i8 = 0;
+    int16_t i16 = 0;
+    int32_t i32 = 0;
+    int64_t i64 = 0;
+    uint8_t u8 = 0;
+    uint16_t u16 = 0;
+    uint32_t u32 = 0;
+    uint64_t u64 = 0;
+    float flt = 0;
+    double dbl = 0;
+    uint8_t *ctypes = NULL;
+    char *data = NULL;
+    char *end = NULL;
+    unsigned long long colspec_l = 0;
+    unsigned long long colspec_idx = 0;
+    char *keywords[] = {"colspec", "data", NULL};
+
+    // Parse function args.
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO", keywords, &py_colspec, &py_data)) {
+        goto error;
+    }
+
+    CHECKRC(PyBytes_AsStringAndSize(py_data, &data, &length));
+    end = data + (unsigned long long)length;
+
+    colspec_l = 10;
+    ctypes = (uint8_t*)malloc(colspec_l);
+
+    py_colspec_iter = PyObject_GetIter(py_colspec);
+    if (!py_colspec_iter) goto error;
+
+    colspec_idx = 0;
+    while ((py_cspec = PyIter_Next(py_colspec_iter))) {
+        py_ctype = PyTuple_GetItem(py_cspec, 1);
+        if (!py_ctype) goto error;
+        ctypes[colspec_idx] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(py_ctype, "id"));
+        Py_DECREF(py_cspec);
+        Py_DECREF(py_ctype);
+        if (colspec_idx >= colspec_l) {
+            colspec_l *= 2;
+            ctypes = realloc(ctypes, colspec_l);
+        }
+        colspec_idx += 1;
+    }
+    ctypes = realloc(ctypes, colspec_idx);
+    colspec_l = colspec_idx;
+
+    py_out = PyList_New(0);
+    if (!py_out) goto error;
+
+    while (end > data) {
+        py_row = PyTuple_New(colspec_l+1);
+        if (!py_row) goto error;
+
+        row_id = *(int64_t*)data; data += 8;
+        CHECKRC(PyTuple_SetItem(py_row, 0, PyLong_FromLongLong(row_id)));
+
+        for (unsigned long long i = 0; i < colspec_l; i++) {
+            is_null = data[0] == '\x01'; data += 1;
+            if (is_null) Py_INCREF(Py_None);
+
+            switch (ctypes[i]) {
+            case DATATYPE_BOOL:
+            //case DATATYPE_BOOLEAN:
+                i8 = *(int8_t*)data; data += 1;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, (i8) ? Py_True : Py_False));
+                    Py_INCREF((i8) ? Py_True : Py_False);
+                }
+                break;
+
+            case DATATYPE_BIT:
+                // TODO
+                break;
+
+            case DATATYPE_TINYINT:
+                i8 = *(int8_t*)data; data += 1;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLong((long)i8)));
+                }
+                break;
+
+            case DATATYPE_UNSIGNED_TINYINT:
+                u8 = *(uint8_t*)data; data += 1;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u8)));
+                }
+                break;
+
+            case DATATYPE_SMALLINT:
+                i16 = *(int16_t*)data; data += 2;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLong((long)i16)));
+                }
+                break;
+
+            case DATATYPE_UNSIGNED_SMALLINT:
+                u16 = *(uint16_t*)data; data += 2;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u16)));
+                }
+                break;
+
+            case DATATYPE_MEDIUMINT:
+            case DATATYPE_INT:
+            //case DATATYPE_INTEGER:
+                i32 = *(int32_t*)data; data += 4;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLong((long)i32)));
+                }
+                break;
+
+            case DATATYPE_UNSIGNED_MEDIUMINT:
+            case DATATYPE_UNSIGNED_INT:
+            //case DATATYPE_UNSIGNED_INTEGER:
+                u32 = *(uint32_t*)data; data += 4;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u32)));
+                }
+                break;
+
+            case DATATYPE_BIGINT:
+                i64 = *(int64_t*)data; data += 8;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLongLong((long long)i64)));
+                }
+                break;
+
+            case DATATYPE_UNSIGNED_BIGINT:
+                u64 = *(uint64_t*)data; data += 8;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLongLong((unsigned long long)u64)));
+                }
+                break;
+
+            case DATATYPE_FLOAT:
+                flt = *(float*)data; data += 4;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyFloat_FromDouble((double)flt)));
+                }
+                break;
+
+            case DATATYPE_DOUBLE:
+            //case DATATYPE_REAL:
+                dbl = *(double*)data; data += 8;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyFloat_FromDouble((double)dbl)));
+                }
+                break;
+
+            case DATATYPE_DECIMAL:
+            //case DATATYPE_DEC:
+            //case DATATYPE_FIXED:
+            //case DATATYPE_NUMERIC:
+                // TODO
+                break;
+
+            case DATATYPE_DATE:
+                // TODO
+                break;
+
+            case DATATYPE_TIME:
+                // TODO
+                break;
+
+            case DATATYPE_TIME_6:
+                // TODO
+                break;
+
+            case DATATYPE_DATETIME:
+                // TODO
+                break;
+
+            case DATATYPE_DATETIME_6:
+                // TODO
+                break;
+
+            case DATATYPE_TIMESTAMP:
+                // TODO
+                break;
+
+            case DATATYPE_TIMESTAMP_6:
+                // TODO
+                break;
+
+            case DATATYPE_YEAR:
+                u16 = *(uint16_t*)data; data += 2;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u16)));
+                }
+                break;
+
+            case DATATYPE_CHAR:
+            case DATATYPE_VARCHAR:
+            case DATATYPE_LONGTEXT:
+            case DATATYPE_MEDIUMTEXT:
+            case DATATYPE_TEXT:
+            case DATATYPE_TINYTEXT:
+            case DATATYPE_JSON:
+            case DATATYPE_GEOGRAPHYPOINT:
+            case DATATYPE_GEOGRAPHY:
+                i64 = *(int64_t*)data; data += 8;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    py_str = PyUnicode_FromStringAndSize(data, (Py_ssize_t)i64);
+                    data += i64;
+                    if (!py_str) goto error;
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, py_str));
+                }
+                break;
+
+            case DATATYPE_BINARY:
+            case DATATYPE_VARBINARY:
+            case DATATYPE_LONGBLOB:
+            case DATATYPE_MEDIUMBLOB:
+            case DATATYPE_BLOB:
+            case DATATYPE_TINYBLOB:
+                i64 = *(int64_t*)data; data += 8;
+                if (is_null) {
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                } else {
+                    py_blob = PyBytes_FromStringAndSize(data, (Py_ssize_t)i64);
+                    data += i64;
+                    if (!py_blob) goto error;
+                    CHECKRC(PyTuple_SetItem(py_row, i+1, py_blob));
+                }
+                break;
+
+            case DATATYPE_ARRAY:
+            case DATATYPE_RECORD:
+                // TODO
+                break;
+
+            default:
+                goto error;
+            }
+        }
+
+        CHECKRC(PyList_Append(py_out, py_row));
+        Py_DECREF(py_row);
+        py_row = NULL;
+    }
+
+exit:
+    if (ctypes) free(ctypes);
+
+    Py_XDECREF(py_colspec_iter);
+    Py_XDECREF(py_cspec);
+    Py_XDECREF(py_ctype);
+    Py_XDECREF(py_row);
+
+    return py_out;
+
+error:
+    Py_XDECREF(py_out);
+    py_out = NULL;
+
+    goto exit;
+}
+
+static PyObject *dump_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs) {
+    PyObject *py_returns = NULL;
+    PyObject *py_data = NULL;
+    PyObject *py_out = NULL;
+    PyObject *py_data_iter = NULL;
+    PyObject *py_row = NULL;
+    PyObject *py_row_iter = NULL;
+    PyObject *py_item = NULL;
+    PyObject *py_ret_iter = NULL;
+    PyObject *py_ret = NULL;
+    uint64_t row_id = 0;
+    uint8_t is_null = 0;
+    int8_t i8 = 0;
+    int16_t i16 = 0;
+    int32_t i32 = 0;
+    int64_t i64 = 0;
+    uint8_t u8 = 0;
+    uint16_t u16 = 0;
+    uint32_t u32 = 0;
+    uint64_t u64 = 0;
+    float flt = 0;
+    double dbl = 0;
+    char *out = NULL;
+    unsigned long long out_l = 0;
+    unsigned long long out_idx = 0;
+    Py_ssize_t length = 0;
+    uint8_t *returns = NULL;
+    unsigned long long returns_l = 0;
+    unsigned long long returns_idx = 0;
+    char *keywords[] = {"returns", "data", NULL};
+    unsigned long long i = 0;
+
+    // Parse function args.
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO", keywords, &py_returns, &py_data)) {
+        goto error;
+    }
+
+    length = PyObject_Length(py_data);
+    if (length == 0) {
+        py_out = PyBytes_FromStringAndSize("", 0);
+        goto exit;
+    }
+
+    // Starting size, it will be resized later
+    out_l = 256 * length;
+    out_idx = 0;
+    out = malloc(out_l);
+    if (!out) goto error;
+
+    // Get return types
+    py_ret_iter = PyObject_GetIter(py_returns);
+    if (!py_ret_iter) goto error;
+
+    returns_l = 10;
+    returns_idx = 0;
+    returns = malloc(returns_l);
+    if (!returns) goto error;
+
+    while ((py_ret = PyIter_Next(py_ret_iter))) {
+        returns[returns_idx] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(py_ret, "id"));
+        returns_idx += sizeof(uint8_t);
+        Py_DECREF(py_ret);
+        if (returns_idx >= returns_l) {
+            returns_l *= 2;
+            returns = realloc(returns, returns_l);
+            if (!returns) goto error;
+        }
+    }
+    returns = realloc(returns, returns_idx);
+    returns_l = returns_idx;
+
+#define CHECKMEM(x) \
+    if ((out_idx + x) > out_l) { \
+        out_l = out_l * 2 + x; \
+        out = realloc(out, out_l); \
+        if (!out) goto error; \
+    }
+
+    py_data_iter = PyObject_GetIter(py_data);
+    if (!py_data_iter) goto error;
+
+    while ((py_row = PyIter_Next(py_data_iter))) {
+        py_row_iter = PyObject_GetIter(py_row);
+        if (!py_row_iter) goto error;
+
+        // First item is always a row ID
+        py_item = PyIter_Next(py_row_iter);
+        if (!py_item) goto error;
+        row_id = (int64_t)PyLong_AsLongLong(py_item);
+
+        CHECKMEM(8);
+        memcpy(out+out_idx, &row_id, 8);
+        out_idx += 8;
+
+        i = 0;
+
+        while ((py_item = PyIter_Next(py_row_iter))) {
+
+            is_null = (uint8_t)(py_item == Py_None);
+
+            CHECKMEM(1);
+            memcpy(out+out_idx, &is_null, 1);
+            out_idx += 1;
+
+            switch (returns[i]) {
+            case DATATYPE_BOOL:
+            //case DATATYPE_BOOLEAN:
+                CHECKMEM(1);
+                i8 = (is_null) ? 0 : (int8_t)PyLong_AsLong(py_item);
+                memcpy(out+out_idx, &i8, 1);
+                out_idx += 1;
+                break;
+
+            case DATATYPE_BIT:
+                // TODO
+                break;
+
+            case DATATYPE_TINYINT:
+                CHECKMEM(1);
+                i8 = (is_null) ? 0 : (int8_t)PyLong_AsLong(py_item);
+                memcpy(out+out_idx, &i8, 1);
+                out_idx += 1;
+                break;
+
+            case DATATYPE_UNSIGNED_TINYINT:
+                CHECKMEM(1);
+                u8 = (is_null) ? 0 : (uint8_t)PyLong_AsUnsignedLong(py_item);
+                memcpy(out+out_idx, &u8, 1);
+                out_idx += 1;
+                break;
+
+            case DATATYPE_SMALLINT:
+                CHECKMEM(2);
+                i16 = (is_null) ? 0 : (int16_t)PyLong_AsLong(py_item);
+                memcpy(out+out_idx, &i16, 2);
+                out_idx += 2;
+                break;
+
+            case DATATYPE_UNSIGNED_SMALLINT:
+                CHECKMEM(2);
+                u16 = (is_null) ? 0 : (uint16_t)PyLong_AsUnsignedLong(py_item);
+                memcpy(out+out_idx, &u16, 2);
+                out_idx += 2;
+                break;
+
+            case DATATYPE_MEDIUMINT:
+            case DATATYPE_INT:
+            //case DATATYPE_INTEGER:
+                CHECKMEM(4);
+                i32 = (is_null) ? 0 : (int32_t)PyLong_AsLong(py_item);
+                memcpy(out+out_idx, &i32, 4);
+                out_idx += 4;
+                break;
+
+            case DATATYPE_UNSIGNED_MEDIUMINT:
+            case DATATYPE_UNSIGNED_INT:
+            //case DATATYPE_UNSIGNED_INTEGER:
+                CHECKMEM(4);
+                u32 = (is_null) ? 0 : (uint32_t)PyLong_AsUnsignedLong(py_item);
+                memcpy(out+out_idx, &u32, 4);
+                out_idx += 4;
+                break;
+
+            case DATATYPE_BIGINT:
+                CHECKMEM(8);
+                i64 = (is_null) ? 0 : (int64_t)PyLong_AsLongLong(py_item);
+                memcpy(out+out_idx, &i64, 8);
+                out_idx += 8;
+                break;
+
+            case DATATYPE_UNSIGNED_BIGINT:
+                CHECKMEM(8);
+                u64 = (is_null) ? 0 : (uint64_t)PyLong_AsUnsignedLongLong(py_item);
+                memcpy(out+out_idx, &u64, 8);
+                out_idx += 8;
+                break;
+
+            case DATATYPE_FLOAT:
+                CHECKMEM(4);
+                flt = (is_null) ? 0 : (float)PyFloat_AsDouble(py_item);
+                memcpy(out+out_idx, &flt, 4);
+                out_idx += 4;
+                break;
+
+            case DATATYPE_DOUBLE:
+            //case DATATYPE_REAL:
+                CHECKMEM(8);
+                dbl = (is_null) ? 0 : (double)PyFloat_AsDouble(py_item);
+                memcpy(out+out_idx, &dbl, 8);
+                out_idx += 8;
+                break;
+
+            case DATATYPE_DECIMAL:
+            //case DATATYPE_DEC:
+            //case DATATYPE_FIXED:
+            //case DATATYPE_NUMERIC:
+                // TODO
+                break;
+
+            case DATATYPE_DATE:
+                // TODO
+                break;
+
+            case DATATYPE_TIME:
+                // TODO
+                break;
+
+            case DATATYPE_TIME_6:
+                // TODO
+                break;
+
+            case DATATYPE_DATETIME:
+                // TODO
+                break;
+
+            case DATATYPE_DATETIME_6:
+                // TODO
+                break;
+
+            case DATATYPE_TIMESTAMP:
+                // TODO
+                break;
+
+            case DATATYPE_TIMESTAMP_6:
+                // TODO
+                break;
+
+            case DATATYPE_YEAR:
+                CHECKMEM(2);
+                i16 = (is_null) ? 0 : (int16_t)PyLong_AsLong(py_item);
+                memcpy(out+out_idx, &i16, 2);
+                out_idx += 2;
+                break;
+
+            case DATATYPE_CHAR:
+            case DATATYPE_VARCHAR:
+            case DATATYPE_LONGTEXT:
+            case DATATYPE_MEDIUMTEXT:
+            case DATATYPE_TEXT:
+            case DATATYPE_TINYTEXT:
+            case DATATYPE_JSON:
+            case DATATYPE_GEOGRAPHYPOINT:
+            case DATATYPE_GEOGRAPHY:
+                {
+                    PyObject *py_bytes = PyUnicode_AsEncodedString(py_item, "utf-8", "strict");
+                    if (!py_bytes) goto error;
+
+                    char *str = NULL;
+                    Py_ssize_t str_l = 0;
+                    if (PyBytes_AsStringAndSize(py_bytes, &str, &str_l) < 0) {
+                        Py_DECREF(py_bytes);
+                        goto error;
+                    }
+
+                    CHECKMEM(8+str_l);
+                    i64 = str_l;
+                    memcpy(out+out_idx, &i64, 8);
+                    out_idx += 8;
+                    memcpy(out+out_idx, str, str_l);
+                    out_idx += str_l;
+                    Py_DECREF(py_bytes);
+                }
+                break;
+
+            case DATATYPE_BINARY:
+            case DATATYPE_VARBINARY:
+            case DATATYPE_LONGBLOB:
+            case DATATYPE_MEDIUMBLOB:
+            case DATATYPE_BLOB:
+            case DATATYPE_TINYBLOB:
+                {
+                    char *str = NULL;
+                    Py_ssize_t str_l = 0;
+                    if (PyBytes_AsStringAndSize(py_item, &str, &str_l) < 0) {
+                        goto error;
+                    }
+
+                    CHECKMEM(str_l+8);
+                    i64 = str_l;
+                    memcpy(out+out_idx, &i64, 8);
+                    out_idx += 8;
+                    memcpy(out+out_idx, str, str_l);
+                    out_idx += str_l;
+                }
+                break;
+
+            case DATATYPE_ARRAY:
+            case DATATYPE_RECORD:
+                // TODO
+                break;
+
+            default:
+                goto error;
+            }
+
+            Py_DECREF(py_item);
+            py_item = NULL;
+
+            i++;
+        }
+
+        Py_DECREF(py_row);
+        py_row = NULL;
+    }
+
+    py_out = PyBytes_FromStringAndSize(out, out_idx);
+    if (!py_out) goto error;
+
+exit:
+    if (returns) free(returns);
+    if (out) free(out);
+
+    Py_XDECREF(py_item);
+    Py_XDECREF(py_row_iter);
+    Py_XDECREF(py_row);
+    Py_XDECREF(py_data_iter);
+
+    return py_out;
+
+error:
+    Py_XDECREF(py_out);
+    py_out = NULL;
+
+    goto exit;
+}
+
 static PyMethodDef PyMySQLAccelMethods[] = {
     {"read_rowdata_packet", (PyCFunction)read_rowdata_packet, METH_VARARGS | METH_KEYWORDS, "PyMySQL row data packet reader"},
+    {"load_rowdat_1", (PyCFunction)load_rowdat_1, METH_VARARGS | METH_KEYWORDS, "ROWDAT_1 parser for external functions"},
+    {"dump_rowdat_1", (PyCFunction)dump_rowdat_1, METH_VARARGS | METH_KEYWORDS, "ROWDAT_1 formatter for external functions"},
     {NULL, NULL, 0, NULL}
 };
 
 static struct PyModuleDef _singlestoredb_accelmodule = {
     PyModuleDef_HEAD_INIT,
     "_singlestoredb_accel",
-    "PyMySQL row data packet reader accelerator",
+    "SingleStoreDB acceleration module",
     -1,
     PyMySQLAccelMethods
 };
@@ -1722,7 +2403,7 @@ PyMODINIT_FUNC PyInit__singlestoredb_accel(void) {
     if (!decimal_mod) goto error;
     PyObject *datetime_mod = PyImport_ImportModule("datetime");
     if (!datetime_mod) goto error;
-    PyObject *json_mod = PyImport_ImportModule("json");
+    PyObject *json_mod = PyImport_ImportModule("ujson");
     if (!json_mod) goto error;
 
     PyFunc.decimal_Decimal = PyObject_GetAttr(decimal_mod, PyStr.Decimal);

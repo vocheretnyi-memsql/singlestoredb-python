@@ -37,7 +37,7 @@ setup(
     ext_modules=[
         Extension(
             '_singlestoredb_accel',
-            sources=['singlestoredb/mysql/accel.c'],
+            sources=['singlestoredb/accel.c'],
             define_macros=[('Py_LIMITED_API', py_limited_api)] if py_limited_api else [],
             py_limited_api=bool(py_limited_api),
             extra_compile_args=universal2_flags,
