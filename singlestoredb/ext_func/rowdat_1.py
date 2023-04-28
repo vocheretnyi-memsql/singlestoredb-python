@@ -4,6 +4,8 @@ import warnings
 from io import BytesIO
 from typing import Any
 from typing import Iterable
+from typing import List
+from typing import Tuple
 
 try:
     import _singlestoredb_accel
@@ -18,7 +20,7 @@ except ImportError:
 from . import dtypes
 
 
-def _load(colspec: Iterable[tuple[str, int]], data: bytes) -> list[list[Any]]:
+def _load(colspec: Iterable[Tuple[str, int]], data: bytes) -> List[List[Any]]:
     '''
     Convert bytes in rowdat_1 format into rows of data.
 
@@ -56,14 +58,14 @@ def _load(colspec: Iterable[tuple[str, int]], data: bytes) -> list[list[Any]]:
     return out
 
 
-def _dump(returns: Iterable[int], data: Iterable[tuple[int, Any]]) -> bytes:
+def _dump(returns: Iterable[int], data: Iterable[Tuple[int, Any]]) -> bytes:
     '''
     Convert a list of lists of data into rowdat_1 format.
 
     Parameters
     ----------
     returns : str
-        The returned data type
+        sThe returned data type
     data : list[list[Any]]
         The rows of data to serialize
 

@@ -187,7 +187,7 @@ def get_func_names(funcs: str) -> List[Tuple[str, str]]:
     return out
 
 
-def call_func(func: Callable[..., Any], row: list[Any]) -> Tuple[int, Any]:
+def call_func(func: Callable[..., Any], row: List[Any]) -> Tuple[int, Any]:
     '''
     Call a function on a row of data.
 
@@ -222,7 +222,7 @@ def make_func(name: str, func: Callable[..., Any]) -> Callable[..., Any]:
     Callable
 
     '''
-    async def do_func(rows: list[Any]) -> List[Any]:
+    async def do_func(rows: List[Any]) -> List[Any]:
         '''Call function on given rows of data.'''
         return list(func_map(functools.partial(call_func, func), rows))
 
