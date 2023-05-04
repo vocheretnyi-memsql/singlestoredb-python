@@ -90,10 +90,10 @@ def sig_to_sql(signature: Dict[str, Any], base_url: Optional[str] = None) -> str
         res = []
         for item in signature['returns']:
             res.append(
-                f'{item["type"].name}'
-                ' null' if item.get('is_nullable') else ' not null',
+                item['type'].name +
+                (' null' if item.get('is_nullable') else ' not null'),
             )
-        returns = 'RETURNS ' + ', '.join(res)
+        returns = ' RETURNS ' + ', '.join(res)
 
     host = os.environ.get('SINGLESTOREDB_EXT_HOST', '127.0.0.1')
     port = os.environ.get('SINGLESTOREDB_EXT_PORT', '8000')
@@ -104,6 +104,7 @@ def sig_to_sql(signature: Dict[str, Any], base_url: Optional[str] = None) -> str
         f'CREATE OR REPLACE EXTERNAL FUNCTION `{signature["name"]}`' +
         '(' + ', '.join(args) + ')' + returns +
         f' AS REMOTE SERVICE "{url}" FORMAT ROWDAT_1;'
+        # f' AS REMOTE SERVICE "{url}" FORMAT JSON;'
     )
 
 
@@ -425,23 +426,40 @@ def create_app(
 
         # Call the endpoint
         elif method == 'POST' and path in endpoints:
+            content_type = 'json'
+            for k, v in scope['headers']:
+                if k == b'content-type':
+                    content_type = v.decode('utf-8')
+                    break
+
             data = io.BytesIO()
             more_body = True
             while more_body:
                 request = await receive()
                 data.write(request['body'])
                 more_body = request.get('more_body', False)
-#           out = await endpoints[path](ujson.loads(request['body'])['data'])
-#           body = ujson.dumps(dict(data=out)).encode('utf-8')
-#           await send(json_response_dict)
+
             func = endpoints[path]
-            out = await func(
-                rowdat_1.load(
-                    func._ext_func_colspec, data.getvalue(),  # type: ignore
-                ),
-            )
-            body = rowdat_1.dump(func._ext_func_returns, out)  # type: ignore
-            await send(rowdat_1_response_dict)
+
+            # JSON
+            if 'json' in content_type:
+                out = await func(
+                    ujson.loads(
+                        data.getvalue().decode('utf-8'),
+                    )['data'],
+                )
+                body = ujson.dumps(dict(data=out)).encode('utf-8')  # type: ignore
+                await send(json_response_dict)
+
+            # ROWDAT_1
+            else:
+                out = await func(
+                    rowdat_1.load(
+                        func._ext_func_colspec, data.getvalue(),  # type: ignore
+                    ),
+                )
+                body = rowdat_1.dump(func._ext_func_returns, out)  # type: ignore
+                await send(rowdat_1_response_dict)
 
         # Path not found
         else:

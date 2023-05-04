@@ -1,6 +1,4 @@
 
-#define Py_LIMITED_API 0x03060000
-
 #include <math.h>
 #include <stdint.h>
 #include <stdlib.h>
@@ -362,6 +360,7 @@ typedef struct {
 inline int IMAX(int a, int b) { return((a) > (b) ? a : b); }
 inline int IMIN(int a, int b) { return((a) < (b) ? a : b); }
 
+#ifdef Py_LIMITED_API
 char *PyUnicode_AsUTF8(PyObject *unicode) {
     PyObject *bytes = PyUnicode_AsEncodedString(unicode, "utf-8", "strict");
     if (!bytes) return NULL;
@@ -378,6 +377,7 @@ char *PyUnicode_AsUTF8(PyObject *unicode) {
     Py_DECREF(bytes);
     return out;
 }
+#endif
 
 //
 // Cached int values for date/time components
@@ -1719,9 +1719,6 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
     PyObject *py_out = NULL;
     PyObject *py_row = NULL;
     PyObject *py_colspec = NULL;
-    PyObject *py_colspec_iter = NULL;
-    PyObject *py_cspec = NULL;
-    PyObject *py_ctype = NULL;
     PyObject *py_str = NULL;
     PyObject *py_blob = NULL;
     Py_ssize_t length = 0;
@@ -1741,7 +1738,7 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
     char *data = NULL;
     char *end = NULL;
     unsigned long long colspec_l = 0;
-    unsigned long long colspec_idx = 0;
+    unsigned long long i = 0;
     char *keywords[] = {"colspec", "data", NULL};
 
     // Parse function args.
@@ -1752,27 +1749,22 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
     CHECKRC(PyBytes_AsStringAndSize(py_data, &data, &length));
     end = data + (unsigned long long)length;
 
-    colspec_l = 10;
-    ctypes = (uint8_t*)malloc(colspec_l);
-
-    py_colspec_iter = PyObject_GetIter(py_colspec);
-    if (!py_colspec_iter) goto error;
-
-    colspec_idx = 0;
-    while ((py_cspec = PyIter_Next(py_colspec_iter))) {
-        py_ctype = PyTuple_GetItem(py_cspec, 1);
-        if (!py_ctype) goto error;
-        ctypes[colspec_idx] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(py_ctype, "id"));
-        Py_DECREF(py_cspec);
-        Py_DECREF(py_ctype);
-        if (colspec_idx >= colspec_l) {
-            colspec_l *= 2;
-            ctypes = realloc(ctypes, colspec_l);
-        }
-        colspec_idx += 1;
+    colspec_l = PyObject_Length(py_colspec);
+    if (colspec_l == 0) {
+        goto error;
     }
-    ctypes = realloc(ctypes, colspec_idx);
-    colspec_l = colspec_idx;
+
+    ctypes = malloc(sizeof(uint8_t) * colspec_l);
+
+    for (i = 0; i < colspec_l; i++) {
+        PyObject *py_cspec = PySequence_GetItem(py_colspec, i);
+        if (!py_cspec) goto error;
+        PyObject *py_ctype = PySequence_GetItem(py_cspec, 1);
+        if (!py_ctype) { Py_DECREF(py_cspec); goto error; }
+        ctypes[i] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(py_ctype, "id"));
+        Py_DECREF(py_ctype);
+        Py_DECREF(py_cspec);
+    }
 
     py_out = PyList_New(0);
     if (!py_out) goto error;
@@ -1998,9 +1990,6 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
 exit:
     if (ctypes) free(ctypes);
 
-    Py_XDECREF(py_colspec_iter);
-    Py_XDECREF(py_cspec);
-    Py_XDECREF(py_ctype);
     Py_XDECREF(py_row);
 
     return py_out;
@@ -2020,8 +2009,6 @@ static PyObject *dump_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
     PyObject *py_row = NULL;
     PyObject *py_row_iter = NULL;
     PyObject *py_item = NULL;
-    PyObject *py_ret_iter = NULL;
-    PyObject *py_ret = NULL;
     uint64_t row_id = 0;
     uint8_t is_null = 0;
     int8_t i8 = 0;
@@ -2040,7 +2027,6 @@ static PyObject *dump_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
     Py_ssize_t length = 0;
     uint8_t *returns = NULL;
     unsigned long long returns_l = 0;
-    unsigned long long returns_idx = 0;
     char *keywords[] = {"returns", "data", NULL};
     unsigned long long i = 0;
 
@@ -2062,26 +2048,19 @@ static PyObject *dump_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
     if (!out) goto error;
 
     // Get return types
-    py_ret_iter = PyObject_GetIter(py_returns);
-    if (!py_ret_iter) goto error;
-
-    returns_l = 10;
-    returns_idx = 0;
-    returns = malloc(returns_l);
-    if (!returns) goto error;
-
-    while ((py_ret = PyIter_Next(py_ret_iter))) {
-        returns[returns_idx] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(py_ret, "id"));
-        returns_idx += sizeof(uint8_t);
-        Py_DECREF(py_ret);
-        if (returns_idx >= returns_l) {
-            returns_l *= 2;
-            returns = realloc(returns, returns_l);
-            if (!returns) goto error;
-        }
+    returns_l = (unsigned long long)PyObject_Length(py_returns);
+    if (returns_l == 0) {
+        goto error;
     }
-    returns = realloc(returns, returns_idx);
-    returns_l = returns_idx;
+
+    returns = malloc(sizeof(uint8_t) * length);
+
+    for (i = 0; i < returns_l; i++) {
+        PyObject *item = PySequence_GetItem(py_returns, i);
+        if (!item) goto error;
+        returns[i] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(item, "id"));
+        Py_DECREF(item);
+    }
 
 #define CHECKMEM(x) \
     if ((out_idx + x) > out_l) { \
