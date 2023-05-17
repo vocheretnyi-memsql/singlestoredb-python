@@ -22,11 +22,8 @@ $ SINGLESTOREDB_EXT_FUNCTIONS='myfuncs.[percentage_90,percentage_95]' \
     uvicorn --factory singlestoredb.ext_func:create_app
 
 '''
-import copy
-import functools
 import importlib
 import inspect
-import io
 import itertools
 import os
 import re
@@ -37,12 +34,10 @@ from typing import Dict
 from typing import Iterable
 from typing import List
 from typing import Optional
+from typing import Sequence
 from typing import Tuple
 from typing import Union
-from urllib.parse import parse_qs
 from urllib.parse import urljoin
-
-import ujson
 
 from . import rowdat_1
 from .annotations import translate_annotation
@@ -54,9 +49,9 @@ if num_processes > 1:
         from ray.util.multiprocessing import Pool
     except ImportError:
         from multiprocessing import Pool
-    func_map = Pool(num_processes).map
+    func_map = Pool(num_processes).starmap
 else:
-    func_map = map
+    func_map = itertools.starmap
 
 
 def sig_to_sql(signature: Dict[str, Any], base_url: Optional[str] = None) -> str:
@@ -104,7 +99,6 @@ def sig_to_sql(signature: Dict[str, Any], base_url: Optional[str] = None) -> str
         f'CREATE OR REPLACE EXTERNAL FUNCTION `{signature["name"]}`' +
         '(' + ', '.join(args) + ')' + returns +
         f' AS REMOTE SERVICE "{url}" FORMAT ROWDAT_1;'
-        # f' AS REMOTE SERVICE "{url}" FORMAT JSON;'
     )
 
 
@@ -188,25 +182,6 @@ def get_func_names(funcs: str) -> List[Tuple[str, str]]:
     return out
 
 
-def call_func(func: Callable[..., Any], row: List[Any]) -> Tuple[int, Any]:
-    '''
-    Call a function on a row of data.
-
-    Parameters
-    ----------
-    func : Callable
-        The function to call
-    row : list[Any]
-        The row of data to use as function parameters
-
-    Returns
-    -------
-    tuple[int, Any] : a tuple containing the row ID and function result
-
-    '''
-    return row[0], func(*row[1:])
-
-
 def make_func(name: str, func: Callable[..., Any]) -> Callable[..., Any]:
     '''
     Make a function endpoint.
@@ -223,9 +198,9 @@ def make_func(name: str, func: Callable[..., Any]) -> Callable[..., Any]:
     Callable
 
     '''
-    async def do_func(rows: List[Any]) -> List[Any]:
+    async def do_func(row_ids: Sequence[int], rows: Sequence[Any]) -> List[Any]:
         '''Call function on given rows of data.'''
-        return list(func_map(functools.partial(call_func, func), rows))
+        return list(zip(row_ids, func_map(func, rows)))
 
     do_func.__name__ = name
     do_func.__doc__ = func.__doc__
@@ -299,10 +274,12 @@ def create_app(
             # Add endpoint for each exported function
             for name, alias in get_func_names(func_names):
                 item = getattr(pkg, name)
-                endpoints[f'/functions/{alias}'] = make_func(alias, item)
+                func = make_func(alias, item)
+                endpoints[f'/functions/{alias}'] = func
         else:
             alias = funcs.__name__
-            endpoints[f'/functions/{alias}'] = make_func(alias, item)
+            func = make_func(alias, item)
+            endpoints[f'/functions/{alias}'] = func
 
     # Plain text response start
     text_response_dict: Dict[str, Any] = dict(
@@ -312,11 +289,11 @@ def create_app(
     )
 
     # JSON response start
-    json_response_dict: Dict[str, Any] = dict(
-        type='http.response.start',
-        status=200,
-        headers=[(b'content-type', b'application/json')],
-    )
+    # json_response_dict: Dict[str, Any] = dict(
+    #     type='http.response.start',
+    #     status=200,
+    #     headers=[(b'content-type', b'application/json')],
+    # )
 
     # ROWDAT_1 response start
     rowdat_1_response_dict: Dict[str, Any] = dict(
@@ -357,109 +334,49 @@ def create_app(
         assert scope['type'] == 'http'
 
         method = scope['method']
-
         path = scope['path']
-        if path.endswith('/'):
-            path = path[:-1]
 
-        # Handle api reflection
-        if method == 'GET' and path == '/functions':
-            query_string = parse_qs(scope.get('query_string', ''))
-
-            # SQL code
-            if query_string.get(b'format', [b'json'])[-1] == b'sql':  # type: ignore
-                host = 'localhost:80'
-                for k, v in scope['headers']:
-                    if k == b'host':
-                        host = v.decode('utf-8')
-                        break
-                url = f'{scope["scheme"]}://{host}{scope["path"]}'
-                await send(text_response_dict)
-                syntax = []
-                for endpoint in endpoints.values():
-                    syntax.append(
-                        sig_to_sql(
-                            endpoint._ext_func_signature,  # type: ignore
-                            base_url=url,
-                        ),
-                    )
-                body = '\n'.join(syntax).encode('utf-8')
-
-            # JSON
-            else:
-                await send(json_response_dict)
-                signatures = [
-                    x._ext_func_signature for x in endpoints.values()  # type: ignore
-                ]
-                signatures = copy.deepcopy(signatures)
-                for sig in signatures:
-                    for i, arg in enumerate(sig['args']):
-                        arg['type'] = arg['type'].name
-                        if 'items' in arg:
-                            arg['items']['type'] = arg['items']['type'].name
-                    for i, ret in enumerate(sig['returns']):
-                        ret['type'] = ret['type'].name
-                        if 'items' in ret:
-                            ret['items']['type'] = ret['items']['type'].name
-                body = ujson.dumps(signatures).encode('utf-8')
-
-        # Create a new function from source
-        elif method == 'PUT' and path == '/create_functions':
-            request = await receive()
-            info = ujson.loads(request['body'])
-
-            glob: Dict[str, Any] = dict()
-            loc: Dict[str, Any] = dict()
-
-            exec(info['code'], glob, loc)
-
-            # This is really needed outside the scope of this app to construct
-            # an appropriate environment for the app to run in.
-            # imports = info['imports']
-
-            # Add endpoint for each exported function
-            for name, alias in get_func_names(info['functions']):
-                endpoints[f'/functions/{alias}'] = make_func(alias, loc[name])
-
-            body = b''
-            await send(json_response_dict)
+        func = endpoints.get(path)
 
         # Call the endpoint
-        elif method == 'POST' and path in endpoints:
-            content_type = 'json'
-            for k, v in scope['headers']:
-                if k == b'content-type':
-                    content_type = v.decode('utf-8')
-                    break
-
-            data = io.BytesIO()
+        if method == 'POST' and func is not None:
+            data = []
             more_body = True
             while more_body:
                 request = await receive()
-                data.write(request['body'])
+                data.append(request['body'])
                 more_body = request.get('more_body', False)
 
-            func = endpoints[path]
+            out = await func(
+                *rowdat_1.load(
+                    func._ext_func_colspec, b''.join(data),  # type: ignore
+                ),
+            )
+            body = rowdat_1.dump(func._ext_func_returns, out)  # type: ignore
 
-            # JSON
-            if 'json' in content_type:
-                out = await func(
-                    ujson.loads(
-                        data.getvalue().decode('utf-8'),
-                    )['data'],
-                )
-                body = ujson.dumps(dict(data=out)).encode('utf-8')  # type: ignore
-                await send(json_response_dict)
+            await send(rowdat_1_response_dict)
 
-            # ROWDAT_1
-            else:
-                out = await func(
-                    rowdat_1.load(
-                        func._ext_func_colspec, data.getvalue(),  # type: ignore
+        # Handle api reflection
+        elif method == 'GET' and path in ['/functions', '/functions/']:
+            host = 'localhost:80'
+            for k, v in scope['headers']:
+                if k == b'host':
+                    host = v.decode('utf-8')
+                    break
+
+            url = f'{scope["scheme"]}://{host}{path}'
+
+            syntax = []
+            for endpoint in endpoints.values():
+                syntax.append(
+                    sig_to_sql(
+                        endpoint._ext_func_signature,  # type: ignore
+                        base_url=url,
                     ),
                 )
-                body = rowdat_1.dump(func._ext_func_returns, out)  # type: ignore
-                await send(rowdat_1_response_dict)
+            body = '\n'.join(syntax).encode('utf-8')
+
+            await send(text_response_dict)
 
         # Path not found
         else:

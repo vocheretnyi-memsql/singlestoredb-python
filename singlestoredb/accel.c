@@ -1717,6 +1717,8 @@ error:
 static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs) {
     PyObject *py_data = NULL;
     PyObject *py_out = NULL;
+    PyObject *py_out_row_ids = NULL;
+    PyObject *py_out_rows = NULL;
     PyObject *py_row = NULL;
     PyObject *py_colspec = NULL;
     PyObject *py_str = NULL;
@@ -1761,20 +1763,39 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
         if (!py_cspec) goto error;
         PyObject *py_ctype = PySequence_GetItem(py_cspec, 1);
         if (!py_ctype) { Py_DECREF(py_cspec); goto error; }
-        ctypes[i] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(py_ctype, "id"));
+        PyObject *py_id = PyObject_GetAttrString(py_ctype, "id");
+        if (!py_id) { Py_DECREF(py_cspec); Py_DECREF(py_ctype); goto error; }
+        ctypes[i] = (uint8_t)PyLong_AsLong(py_id);
         Py_DECREF(py_ctype);
         Py_DECREF(py_cspec);
     }
 
-    py_out = PyList_New(0);
-    if (!py_out) goto error;
+    py_out_row_ids = PyList_New(0);
+    if (!py_out_row_ids) goto error;
+
+    py_out_rows = PyList_New(0);
+    if (!py_out_rows) { Py_DECREF(py_out_row_ids); goto error; }
+
+    py_out = PyTuple_New(2);
+    if (!py_out) { Py_DECREF(py_out_row_ids); Py_DECREF(py_out_rows); goto error; }
+
+    if (PyTuple_SetItem(py_out, 0, py_out_row_ids) < 0) {
+        Py_DECREF(py_out_row_ids);
+        Py_DECREF(py_out_rows);
+        goto error;
+    }
+
+    if (PyTuple_SetItem(py_out, 1, py_out_rows) < 0) {
+        Py_DECREF(py_out_rows);
+        goto error;
+    }
 
     while (end > data) {
-        py_row = PyTuple_New(colspec_l+1);
+        py_row = PyTuple_New(colspec_l);
         if (!py_row) goto error;
 
         row_id = *(int64_t*)data; data += 8;
-        CHECKRC(PyTuple_SetItem(py_row, 0, PyLong_FromLongLong(row_id)));
+        CHECKRC(PyList_Append(py_out_row_ids, PyLong_FromLongLong(row_id)));
 
         for (unsigned long long i = 0; i < colspec_l; i++) {
             is_null = data[0] == '\x01'; data += 1;
@@ -1785,9 +1806,10 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             //case DATATYPE_BOOLEAN:
                 i8 = *(int8_t*)data; data += 1;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, (i8) ? Py_True : Py_False));
+                    CHECKRC(PyTuple_SetItem(py_row, i, (i8) ? Py_True : Py_False));
                     Py_INCREF((i8) ? Py_True : Py_False);
                 }
                 break;
@@ -1799,36 +1821,40 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             case DATATYPE_TINYINT:
                 i8 = *(int8_t*)data; data += 1;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLong((long)i8)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromLong((long)i8)));
                 }
                 break;
 
             case DATATYPE_UNSIGNED_TINYINT:
                 u8 = *(uint8_t*)data; data += 1;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u8)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromUnsignedLong((unsigned long)u8)));
                 }
                 break;
 
             case DATATYPE_SMALLINT:
                 i16 = *(int16_t*)data; data += 2;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLong((long)i16)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromLong((long)i16)));
                 }
                 break;
 
             case DATATYPE_UNSIGNED_SMALLINT:
                 u16 = *(uint16_t*)data; data += 2;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u16)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromUnsignedLong((unsigned long)u16)));
                 }
                 break;
 
@@ -1837,9 +1863,10 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             //case DATATYPE_INTEGER:
                 i32 = *(int32_t*)data; data += 4;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLong((long)i32)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromLong((long)i32)));
                 }
                 break;
 
@@ -1848,36 +1875,40 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             //case DATATYPE_UNSIGNED_INTEGER:
                 u32 = *(uint32_t*)data; data += 4;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u32)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromUnsignedLong((unsigned long)u32)));
                 }
                 break;
 
             case DATATYPE_BIGINT:
                 i64 = *(int64_t*)data; data += 8;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromLongLong((long long)i64)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromLongLong((long long)i64)));
                 }
                 break;
 
             case DATATYPE_UNSIGNED_BIGINT:
                 u64 = *(uint64_t*)data; data += 8;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLongLong((unsigned long long)u64)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromUnsignedLongLong((unsigned long long)u64)));
                 }
                 break;
 
             case DATATYPE_FLOAT:
                 flt = *(float*)data; data += 4;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyFloat_FromDouble((double)flt)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyFloat_FromDouble((double)flt)));
                 }
                 break;
 
@@ -1885,9 +1916,10 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             //case DATATYPE_REAL:
                 dbl = *(double*)data; data += 8;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyFloat_FromDouble((double)dbl)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyFloat_FromDouble((double)dbl)));
                 }
                 break;
 
@@ -1929,9 +1961,10 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             case DATATYPE_YEAR:
                 u16 = *(uint16_t*)data; data += 2;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, PyLong_FromUnsignedLong((unsigned long)u16)));
+                    CHECKRC(PyTuple_SetItem(py_row, i, PyLong_FromUnsignedLong((unsigned long)u16)));
                 }
                 break;
 
@@ -1946,12 +1979,13 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             case DATATYPE_GEOGRAPHY:
                 i64 = *(int64_t*)data; data += 8;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
                     py_str = PyUnicode_FromStringAndSize(data, (Py_ssize_t)i64);
                     data += i64;
                     if (!py_str) goto error;
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, py_str));
+                    CHECKRC(PyTuple_SetItem(py_row, i, py_str));
                 }
                 break;
 
@@ -1963,12 +1997,13 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             case DATATYPE_TINYBLOB:
                 i64 = *(int64_t*)data; data += 8;
                 if (is_null) {
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, Py_None));
+                    CHECKRC(PyTuple_SetItem(py_row, i, Py_None));
+                    Py_INCREF(Py_None);
                 } else {
                     py_blob = PyBytes_FromStringAndSize(data, (Py_ssize_t)i64);
                     data += i64;
                     if (!py_blob) goto error;
-                    CHECKRC(PyTuple_SetItem(py_row, i+1, py_blob));
+                    CHECKRC(PyTuple_SetItem(py_row, i, py_blob));
                 }
                 break;
 
@@ -1982,7 +2017,7 @@ static PyObject *load_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
             }
         }
 
-        CHECKRC(PyList_Append(py_out, py_row));
+        CHECKRC(PyList_Append(py_out_rows, py_row));
         Py_DECREF(py_row);
         py_row = NULL;
     }
@@ -2049,17 +2084,18 @@ static PyObject *dump_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
 
     // Get return types
     returns_l = (unsigned long long)PyObject_Length(py_returns);
-    if (returns_l == 0) {
-        goto error;
-    }
+    if (returns_l == 0) goto error;
 
     returns = malloc(sizeof(uint8_t) * length);
+    if (!returns) goto error;
 
     for (i = 0; i < returns_l; i++) {
-        PyObject *item = PySequence_GetItem(py_returns, i);
-        if (!item) goto error;
-        returns[i] = (uint8_t)PyLong_AsLong(PyObject_GetAttrString(item, "id"));
-        Py_DECREF(item);
+        PyObject *py_item = PySequence_GetItem(py_returns, i);
+        if (!py_item) goto error;
+        PyObject *py_id = PyObject_GetAttrString(py_item, "id");
+        if (!py_id) { Py_DECREF(py_item); goto error; }
+        returns[i] = (uint8_t)PyLong_AsLong(py_id);
+        Py_DECREF(py_item);
     }
 
 #define CHECKMEM(x) \
@@ -2268,7 +2304,7 @@ static PyObject *dump_rowdat_1(PyObject *self, PyObject *args, PyObject *kwargs)
                         goto error;
                     }
 
-                    CHECKMEM(str_l+8);
+                    CHECKMEM(8+str_l);
                     i64 = str_l;
                     memcpy(out+out_idx, &i64, 8);
                     out_idx += 8;
