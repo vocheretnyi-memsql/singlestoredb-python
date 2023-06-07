@@ -17,7 +17,7 @@ except ImportError:
     )
     _singlestoredb_accel = None
 
-from . import dtypes
+from ..udf import dtypes
 
 
 def _load(colspec: Iterable[Tuple[str, int]], data: bytes) -> List[List[Any]]:

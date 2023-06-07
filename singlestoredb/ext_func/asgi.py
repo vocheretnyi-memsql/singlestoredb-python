@@ -23,10 +23,8 @@ $ SINGLESTOREDB_EXT_FUNCTIONS='myfuncs.[percentage_90,percentage_95]' \
 
 '''
 import importlib
-import inspect
 import itertools
 import os
-import re
 from typing import Any
 from typing import Awaitable
 from typing import Callable
@@ -37,10 +35,10 @@ from typing import Optional
 from typing import Sequence
 from typing import Tuple
 from typing import Union
-from urllib.parse import urljoin
 
 from . import rowdat_1
-from .annotations import translate_annotation
+from ..udf.signature import get_signature
+from ..udf.signature import signature_to_sql
 
 # If a number of processes is specified, create a pool of workers
 num_processes = max(0, int(os.environ.get('SINGLESTOREDB_EXT_NUM_PROCESSES', 0)))
@@ -52,100 +50,6 @@ if num_processes > 1:
     func_map = Pool(num_processes).starmap
 else:
     func_map = itertools.starmap
-
-
-def sig_to_sql(signature: Dict[str, Any], base_url: Optional[str] = None) -> str:
-    '''
-    Convert a dictionary function signature into SQL.
-
-    Parameters
-    ----------
-    signature : Dict[str, Any]
-        Function signature in the form of a dictionary as returned by
-        the `get_sig` function
-
-    Returns
-    -------
-    str : SQL formatted function signature
-
-    '''
-    args = []
-    for arg in signature['args']:
-        if arg['type'].name == 'array':
-            args.append(
-                f'`{arg["name"]}` array({arg["items"]["type"].name}'
-                ' null)' if arg['items'].get('is_nullable') else ' not null)',
-            )
-        else:
-            args.append(f'`{arg["name"]}` {arg["type"].name}')
-        args[-1] += ' null' if arg.get('is_nullable') else ' not null'
-
-    returns = ''
-    if signature.get('returns'):
-        res = []
-        for item in signature['returns']:
-            res.append(
-                item['type'].name +
-                (' null' if item.get('is_nullable') else ' not null'),
-            )
-        returns = ' RETURNS ' + ', '.join(res)
-
-    host = os.environ.get('SINGLESTOREDB_EXT_HOST', '127.0.0.1')
-    port = os.environ.get('SINGLESTOREDB_EXT_PORT', '8000')
-
-    url = urljoin(base_url or f'https://{host}:{port}', signature['endpoint'])
-
-    return (
-        f'CREATE OR REPLACE EXTERNAL FUNCTION `{signature["name"]}`' +
-        '(' + ', '.join(args) + ')' + returns +
-        f' AS REMOTE SERVICE "{url}" FORMAT ROWDAT_1;'
-    )
-
-
-def get_sig(name: str, func: Callable[..., Any]) -> Dict[str, Any]:
-    '''
-    Print the UDF signature of the Python callable.
-
-    Parameters
-    ----------
-    func : Callable
-        The function to extract the signature of
-
-    '''
-    args: List[Dict[str, Any]] = []
-    out: Dict[str, Any] = dict(name=name, args=args)
-    spec = inspect.getfullargspec(func)
-
-    annotations = dict(spec.annotations)
-
-    # Make sure all arguments are annotated
-    spec_diff = set(spec.args).difference(set(annotations.keys()))
-    if spec_diff:
-        raise ValueError(
-            'missing annotations for {} in {}'
-            .format(', '.join(spec_diff), name),
-        )
-
-    for arg in spec.args:
-        ann = spec.annotations[arg]
-        args.append(dict(name=arg, **translate_annotation(ann)))
-
-    if 'return' not in spec.annotations:
-        raise ValueError(f'no return value annotation in function {name}')
-
-    if spec.annotations['return']:
-        ann = spec.annotations['return']
-        if re.match(r'^(typing\.)?Tuple\[', str(ann), flags=re.I):
-            out['returns'] = []
-            for item in ann.__args__:
-                out['returns'].append(translate_annotation(item))
-        else:
-            out['returns'] = [translate_annotation(ann)]
-
-    out['endpoint'] = f'/functions/{name}'
-    out['doc'] = func.__doc__
-
-    return out
 
 
 def get_func_names(funcs: str) -> List[Tuple[str, str]]:
@@ -204,7 +108,7 @@ def make_func(name: str, func: Callable[..., Any]) -> Callable[..., Any]:
 
     do_func.__name__ = name
     do_func.__doc__ = func.__doc__
-    sig = get_sig(name, func)
+    sig = get_signature(name, func)
     do_func._ext_func_signature = sig  # type: ignore
     do_func._ext_func_colspec = [(x['name'], x['type'])  # type: ignore
                                  for x in sig['args']]
@@ -369,7 +273,7 @@ def create_app(
             syntax = []
             for endpoint in endpoints.values():
                 syntax.append(
-                    sig_to_sql(
+                    signature_to_sql(
                         endpoint._ext_func_signature,  # type: ignore
                         base_url=url,
                     ),
