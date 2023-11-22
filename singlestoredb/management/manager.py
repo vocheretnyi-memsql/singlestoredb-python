@@ -52,6 +52,9 @@ class Manager(object):
         ) + '/'
         self._params: Dict[str, str] = {}
 
+        from ..fusion.cache import Cache
+        self.cache = Cache()
+
     def _check(
         self, res: requests.Response, url: str, params: Dict[str, Any],
     ) -> requests.Response:

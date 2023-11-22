@@ -1009,19 +1009,18 @@ class Workspace(object):
             If timeout is reached
 
         """
-        from ..fusion import cache
         if self._manager is None:
             raise ManagementError(
                 msg='No workspace manager is associated with this object.',
             )
         self._manager._delete(f'workspaces/{self.id}')
-        cache.invalidate('Workspaces')
+        self._manager.cache.invalidate('Workspaces')
         if wait_on_terminated:
             self._manager._wait_on_state(
                 self._manager.get_workspace(self.id),
                 'Terminated', interval=wait_interval, timeout=wait_timeout,
             )
-            cache.invalidate('Workspaces')
+            self._manager.cache.invalidate('Workspaces')
             self.refresh()
 
     def connect(self, **kwargs: Any) -> connection.Connection:
@@ -1172,7 +1171,6 @@ class WorkspaceGroup(object):
             List of allowed incoming IP addresses
 
         """
-        from ..fusion import cache
         if self._manager is None:
             raise ManagementError(
                 msg='No workspace manager is associated with this object.',
@@ -1184,7 +1182,7 @@ class WorkspaceGroup(object):
             ).items() if v is not None
         }
         self._manager._patch(f'workspaceGroups/{self.id}', json=data)
-        cache.invalidate('WorkspaceGroups')
+        self._manager.cache.invalidate('WorkspaceGroups')
         self.refresh()
 
     def terminate(
@@ -1213,13 +1211,12 @@ class WorkspaceGroup(object):
             If timeout is reached
 
         """
-        from ..fusion import cache
         if self._manager is None:
             raise ManagementError(
                 msg='No workspace manager is associated with this object.',
             )
         self._manager._delete(f'workspaceGroups/{self.id}', params=dict(force=force))
-        cache.invalidate('WorkspaceGroups')
+        self._manager.cache.invalidate('WorkspaceGroups')
         if wait_on_terminated:
             while True:
                 self.refresh()
@@ -1231,7 +1228,7 @@ class WorkspaceGroup(object):
                     )
                 time.sleep(wait_interval)
                 wait_timeout -= wait_interval
-            cache.invalidate('WorkspaceGroups')
+            self._manager.cache.invalidate('WorkspaceGroups')
 
     def create_workspace(
         self, name: str, size: Optional[str] = None,
@@ -1272,12 +1269,11 @@ class WorkspaceGroup(object):
     @property
     def workspaces(self) -> NamedList[Workspace]:
         """Return a list of available workspaces."""
-        from ..fusion import cache
         if self._manager is None:
             raise ManagementError(
                 msg='No workspace manager is associated with this object.',
             )
-        res = cache.update(
+        res = self._manager.cache.update(
             'Workspaces',
             lambda: self._manager._get(  # type: ignore
                 'workspaces',
@@ -1393,8 +1389,10 @@ class WorkspaceManager(Manager):
     @ property
     def workspace_groups(self) -> NamedList[WorkspaceGroup]:
         """Return a list of available workspace groups."""
-        from ..fusion import cache
-        res = cache.update('WorkspaceGroups', lambda: self._get('workspaceGroups').json())
+        res = self.cache.update(
+            'WorkspaceGroups',
+            lambda: self._get('workspaceGroups').json(),
+        )
         return NamedList([WorkspaceGroup.from_dict(item, self) for item in res])
 
     @ property
@@ -1410,8 +1408,7 @@ class WorkspaceManager(Manager):
     @ property
     def regions(self) -> NamedList[Region]:
         """Return a list of available regions."""
-        from ..fusion import cache
-        res = cache.update('Regions', lambda: self._get('regions').json())
+        res = self.cache.update('Regions', lambda: self._get('regions').json())
         return NamedList([Region.from_dict(item, self) for item in res])
 
     def create_workspace_group(
@@ -1453,7 +1450,6 @@ class WorkspaceManager(Manager):
         :class:`WorkspaceGroup`
 
         """
-        from ..fusion import cache
         if isinstance(region, Region):
             region = region.id
         res = self._post(
@@ -1466,7 +1462,7 @@ class WorkspaceManager(Manager):
                 updateWindow=update_window,
             ),
         )
-        cache.invalidate('WorkspaceGroups')
+        self.cache.invalidate('WorkspaceGroups')
         return self.get_workspace_group(res.json()['workspaceGroupID'])
 
     def create_workspace(
@@ -1498,7 +1494,6 @@ class WorkspaceManager(Manager):
         :class:`Workspace`
 
         """
-        from ..fusion import cache
         if isinstance(workspace_group, WorkspaceGroup):
             workspace_group = workspace_group.id
         res = self._post(
@@ -1507,14 +1502,14 @@ class WorkspaceManager(Manager):
                 size=size,
             ),
         )
-        cache.invalidate('Workspaces')
+        self.cache.invalidate('Workspaces')
         out = self.get_workspace(res.json()['workspaceID'])
         if wait_on_active:
             out = self._wait_on_state(
                 out, 'Active', interval=wait_interval,
                 timeout=wait_timeout,
             )
-            cache.invalidate('Workspaces')
+            self.cache.invalidate('Workspaces')
         return out
 
     def get_workspace_group(self, id: str) -> WorkspaceGroup:

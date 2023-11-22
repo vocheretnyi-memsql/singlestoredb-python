@@ -24,13 +24,15 @@ from typing import Tuple
 
 CACHE_NAME = 'file:fusion?mode=memory&cache=shared'
 SCHEMA = r'''
-    CREATE TABLE fusion.Regions (
+    BEGIN;
+
+    CREATE TABLE IF NOT EXISTS fusion.Regions (
         regionID TEXT PRIMARY KEY NOT NULL,
         region TEXT NOT NULL,
         provider TEXT NOT NULL
     );
 
-    CREATE TABLE fusion.WorkspaceGroups (
+    CREATE TABLE IF NOT EXISTS fusion.WorkspaceGroups (
         workspaceGroupID TEXT PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
         regionID TEXT NOT NULL,
@@ -43,7 +45,7 @@ SCHEMA = r'''
         updateWindow JSON
     );
 
-    CREATE TABLE fusion.Workspaces (
+    CREATE TABLE IF NOT EXISTS fusion.Workspaces (
         workspaceID TEXT PRIMARY KEY NOT NULL,
         name TEXT NOT NULL,
         workspaceGroupID TEXT NOT NULL,
@@ -55,6 +57,13 @@ SCHEMA = r'''
         terminatedAt TEXT,
         scalingProgress INTEGER
     );
+
+    CREATE TABLE IF NOT EXISTS fusion.FusionStatistics (
+        tableName TEXT PRIMARY KEY NOT NULL,
+        lastModifiedTime DATETIME NOT NULL
+    );
+
+    COMMIT;
 '''
 CACHE_TIMEOUTS = dict(
     Regions=datetime.timedelta(hours=12),
@@ -99,9 +108,7 @@ def adapt_bool(val: Optional[Any]) -> Optional[bool]:
 
 
 sqlite3.register_adapter(datetime.date, adapt_date_iso)
-sqlite3.register_adapter(datetime.date, adapt_date_iso)
 sqlite3.register_adapter(datetime.datetime, adapt_datetime_iso)
-sqlite3.register_adapter(datetime.datetime, adapt_datetime_epoch)
 sqlite3.register_adapter(bool, adapt_bool)
 sqlite3.register_adapter(list, adapt_json)
 sqlite3.register_adapter(dict, adapt_json)
@@ -142,73 +149,84 @@ sqlite3.register_converter('json', convert_json)
 
 
 def dict_factory(cursor: Any, row: Tuple[Any, ...]) -> Dict[str, Any]:
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
+    """Return row as a dictionary."""
+    return {k[0]: v for k, v in zip(cursor.description, row)}
 
 
-def connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(':memory:', uri=True, detect_types=sqlite3.PARSE_DECLTYPES)
-    conn.cursor().execute(f'ATTACH "{CACHE_NAME}" AS fusion')
-    return conn
+class Cache(object):
 
+    table_fields: Dict[str, List[str]] = {}
 
-def invalidate(table: str) -> None:
-    _last_modified_time.pop(table, None)
+    def __init__(self) -> None:
+        self.connection = self.connect()
+        cur = self.connection.cursor()
+        cur.executescript(SCHEMA)
 
+        # Cache table fields
+        if not self.table_fields:
+            cur.execute('SELECT name FROM fusion.sqlite_master WHERE type = "table"')
+            for table in cur.fetchall():
+                info = cur.execute(f'PRAGMA fusion.table_info({table[0]})').fetchall()
+                self.table_fields[table[0]] = info
 
-def update(table: str, func: Callable[[], Any]) -> List[Dict[str, Any]]:
-    with connect() as conn:
+    def connect(self) -> sqlite3.Connection:
+        conn = sqlite3.connect(':memory:', uri=True, detect_types=sqlite3.PARSE_DECLTYPES)
+        conn.cursor().execute(f'ATTACH "{CACHE_NAME}" AS fusion')
+        return conn
 
-        # If we are within the cache timeout, return the current results
-        if table in _last_modified_time:
-            if datetime.datetime.now() - _last_modified_time[table] \
-                    < CACHE_TIMEOUTS[table]:
+    def invalidate(self, table: str) -> None:
+        with self.connect() as conn:
+            cur = conn.cursor()
+            cur.execute('DELETE FROM fusion.FusionStatistics WHERE tableName = "{table}"')
+
+    def update(self, table: str, func: Callable[[], Any]) -> List[Dict[str, Any]]:
+        with self.connect() as conn:
+
+            cur = conn.cursor()
+
+            stats = cur.execute(
+                'SELECT tableName, lastModifiedTime FROM fusion.FusionStatistics '
+                f'where tableName = "{table}"',
+            ).fetchall()
+
+            # If we are within the cache timeout, return the current results
+            if stats and (datetime.datetime.now() - stats[0][1]) < CACHE_TIMEOUTS[table]:
                 conn.row_factory = dict_factory
                 return list(conn.cursor().execute(f'SELECT * FROM fusion.{table}'))
 
-        cur = conn.cursor()
+            # Build query components
+            columns = [x[1] for x in self.table_fields[table]]
+            values = func()
+            fields = []
+            field_subs = []
+            conflict = []
+            for k, v in values[0].items():
+                if k not in columns:
+                    continue
+                fields.append(k)
+                field_subs.append(f':{k}')
+                conflict.append(f'{k}=excluded.{k}')
 
-        # Get column names and primary key
-        columns = _table_fields.get(table)
-        if columns is None:
-            columns = [x[1] for x in cur.execute(f'PRAGMA fusion.table_info({table})')]
-            _table_fields[table] = columns
+            try:
+                cur.execute('BEGIN')
 
-        # Build query components
-        values = func()
-        fields = []
-        field_subs = []
-        conflict = []
-        for k, v in values[0].items():
-            if k not in columns:
-                continue
-            fields.append(k)
-            field_subs.append(f':{k}')
-            conflict.append(f'{k}=excluded.{k}')
+                # Insert the new value
+                query = f'INSERT INTO fusion.{table}({", ".join(fields)}) ' \
+                        f'  VALUES({", ".join(field_subs)}) ' \
+                        f'  ON CONFLICT({columns[0]}) DO UPDATE SET {", ".join(conflict)}'
+                cur.executemany(query, values)
 
-        query = f'INSERT INTO fusion.{table}({", ".join(fields)}) ' \
-                f'    VALUES ({", ".join(field_subs)}) ' \
-                f'    ON CONFLICT({columns[0]}) DO UPDATE SET {", ".join(conflict)}' \
+                # Update the last modified time
+                query = 'INSERT INTO fusion.FusionStatistics ' \
+                        '  (tableName, lastModifiedTime) ' \
+                        '  VALUES(:tableName, :lastModifiedTime) ' \
+                        '  ON CONFLICT(tableName) DO UPDATE SET ' \
+                        '      lastModifiedTime=excluded.lastModifiedTime'
+                cur.execute(query, (table, datetime.datetime.now()))
 
-        _last_modified_time[table] = datetime.datetime.now()
+                cur.execute('COMMIT')
 
-        cur.executemany(query, values)
+            except Exception:
+                cur.execute('ROLLBACK')
 
-        return values
-
-
-conn = sqlite3.connect(':memory:')
-cur = conn.cursor()
-cur.execute(f'ATTACH "{CACHE_NAME}" AS fusion')
-cur.executescript(SCHEMA)
-
-# Make sure tha database stays for the length of the process
-_main_connection = dict(fusion=conn)
-
-# Last modified times of tables
-_last_modified_time: Dict[str, datetime.datetime] = {}
-
-# Table fields cache
-_table_fields: Dict[str, List[str]] = {}
+            return values
