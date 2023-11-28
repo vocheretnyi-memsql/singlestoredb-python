@@ -17,7 +17,9 @@ from ..mysql.constants.FIELD_TYPE import DATETIME  # noqa: F401
 from ..mysql.constants.FIELD_TYPE import DOUBLE  # noqa: F401
 from ..mysql.constants.FIELD_TYPE import JSON  # noqa: F401
 from ..mysql.constants.FIELD_TYPE import LONGLONG as INTEGER  # noqa: F401
+from ..mysql.constants.FIELD_TYPE import NULL  # noqa: F401
 from ..mysql.constants.FIELD_TYPE import STRING  # noqa: F401
+from ..mysql.constants.FIELD_TYPE import TIME  # noqa: F401
 from ..utils.results import Description
 from ..utils.results import format_results
 
