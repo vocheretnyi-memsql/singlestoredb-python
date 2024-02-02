@@ -38,6 +38,7 @@ from typing import Sequence
 from typing import Tuple
 from typing import Union
 
+from . import arrow
 from . import json as jdata
 from . import rowdat_1
 from ... import connection
@@ -308,6 +309,13 @@ def create_app(
         headers=[(b'content-type', b'x-application/rowdat_1')],
     )
 
+    # Apache Arrow response start
+    arrow_response_dict: Dict[str, Any] = dict(
+        type='http.response.start',
+        status=200,
+        headers=[(b'content-type', b'application/vnd.apache.arrow.file')],
+    )
+
     # Path not found response start
     path_not_found_response_dict: Dict[str, Any] = dict(
         type='http.response.start',
@@ -371,6 +379,31 @@ def create_app(
             dump=jdata.dump_arrow,
             response=json_response_dict,
         ),
+        (b'application/vnd.apache.arrow.file', b'1.0', 'python'): dict(
+            load=arrow.load,
+            dump=arrow.dump,
+            response=arrow_response_dict,
+        ),
+        (b'application/vnd.apache.arrow.file', b'1.0', 'pandas'): dict(
+            load=arrow.load_pandas,
+            dump=arrow.dump_pandas,
+            response=arrow_response_dict,
+        ),
+        (b'application/vnd.apache.arrow.file', b'1.0', 'numpy'): dict(
+            load=arrow.load_numpy,
+            dump=arrow.dump_numpy,
+            response=arrow_response_dict,
+        ),
+        (b'application/vnd.apache.arrow.file', b'1.0', 'polars'): dict(
+            load=arrow.load_polars,
+            dump=arrow.dump_polars,
+            response=arrow_response_dict,
+        ),
+        (b'application/vnd.apache.arrow.file', b'1.0', 'arrow'): dict(
+            load=arrow.load_arrow,
+            dump=arrow.dump_arrow,
+            response=arrow_response_dict,
+        ),
     }
 
     # Valid URL paths
@@ -403,7 +436,7 @@ def create_app(
 
         content_type = headers.get(
             b'content-type',
-            b'application/octet-stream',
+            b'application/vnd.apache.arrow.file',
         )
         accepts = headers.get(b'accepts', content_type)
         func_name = headers.get(b's2-ef-name', b'')
@@ -436,7 +469,7 @@ def create_app(
         elif method == 'GET' and path == show_create_function_path:
             host = headers.get(b'host', b'localhost:80')
             url = f'{scope["scheme"]}://{host.decode("utf-8")}/invoke'
-            data_format = 'json' if b'json' in content_type else 'rowdat_1'
+            data_format = 'json' if b'json' in content_type else 'arrow'
 
             syntax = []
             for key, endpoint in endpoints.items():
@@ -464,7 +497,7 @@ def create_app(
 
     def show_create_functions(
         base_url: str = 'http://localhost:8000',
-        data_format: str = 'rowdat_1',
+        data_format: str = 'arrow',
     ) -> List[str]:
         out = []
         for key, endpoint in endpoints.items():
@@ -482,7 +515,7 @@ def create_app(
     def register_functions(
         *connection_args: Any,
         base_url: str = 'http://localhost:8000',
-        data_format: str = 'rowdat_1',
+        data_format: str = 'arrow',
         **connection_kwargs: Any,
     ) -> None:
         with connection.connect(*connection_args, **connection_kwargs) as conn:
