@@ -1,7 +1,10 @@
+# type: ignore
+import time
+
+import pandas as pd
+
 import singlestoredb as s2
 from singlestoredb.config import set_option
-import pandas as pd
-import time
 
 BATCH_SIZE = 10000
 QUERY_3_COL = 'SELECT i, d, t FROM 3_col_test'
@@ -54,8 +57,10 @@ def arrow_read_pandas(conn, query):
 
 def main():
     set_option('debug.queries', True)
-    conn = s2.connect(host=HOST, port=PORT, user=USERNAME,
-                      password=PASSWORD, database=DATABASE)
+    conn = s2.connect(
+        host=HOST, port=PORT, user=USERNAME,
+        password=PASSWORD, database=DATABASE,
+    )
     n_runs = 5
     regular_total = 0
     arrow_total = 0

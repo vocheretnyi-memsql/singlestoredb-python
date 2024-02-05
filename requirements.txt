@@ -1,8 +1,8 @@
 build
+pandas
 parsimonious
+pyarrow
 PyJWT
 requests
 sqlparams
 wheel
-pyarrow
-pandas

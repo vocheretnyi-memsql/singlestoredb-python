@@ -1,6 +1,7 @@
 # type: ignore
 import re
 from collections import namedtuple
+
 import pyarrow
 
 from . import err
@@ -208,7 +209,7 @@ class Cursor(BaseCursor):
         while self.nextset():
             pass
         query = self.mogrify(query, args)
-        query += f" OPTION (result_arrow_batch = {result_batch_size})"
+        query += f' OPTION (result_arrow_batch = {result_batch_size})'
         log_query(query, args)
         self._is_arrow = True
         result = self._query(query)
