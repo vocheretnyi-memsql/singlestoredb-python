@@ -5,6 +5,7 @@ from collections import namedtuple
 from . import err
 from ..connection import Cursor as BaseCursor
 from ..utils.debug import log_query
+from ..utils.results import Description
 
 
 #: Regular expression for :meth:`Cursor.executemany`.
@@ -175,8 +176,8 @@ class Cursor(BaseCursor):
         """
         Execute a query.
 
-        If args is a list or tuple, :1, :2, etc. can be used as a
-        placeholder in the query.  If args is a dict, :name can be used
+        If args is a list or tuple, %s can be used as a
+        placeholder in the query.  If args is a dict, %(name)s can be used
         as a placeholder in the query.
 
         Parameters
@@ -501,6 +502,144 @@ class NamedtupleCursor(NamedtupleCursorMixin, Cursor):
 
 class NamedtupleCursorSV(Cursor):
     """A cursor which returns results as a named tuple for C extension."""
+
+
+class ArrowCursor(Cursor):
+    """A cursor which supports Arrow transfer from SingleStoreDB."""
+
+    output_format = 'table'
+    _first_batch = None
+
+    def fetchone(self):
+        """Fetch the next batch of rows."""
+        import pyarrow as pa
+
+        if self._first_batch is not None:
+            out = self._first_batch
+            self._first_batch = None
+
+        else:
+            blob = Cursor.fetchone(self)
+            if blob is None or len(blob) == 0:
+                return None
+
+            with pa.ipc.open_stream(blob[0]) as reader:
+                out = pa.Table.from_batches(reader)
+
+        self._rownumber += out.num_rows
+
+        if type(self).output_format == 'dataframe':
+            return out.to_pandas()
+        return out
+
+    def fetchmany(self, size=None):
+        """Fetch several batches of rows."""
+        # TODO: Allow multiples of Arrow batch size?
+        raise self.NotSupportedError(0, 'fetchmany is not supported in Arrow cursors')
+
+    def fetchall(self):
+        """Fetch all the rows."""
+        import pyarrow as pa
+
+        batches = []
+
+        if self._first_batch is not None:
+            batches.append(self._first_batch)
+            self._first_batch = None
+
+        while True:
+            blob = Cursor.fetchone(self)
+            if blob is None or len(blob) == 0:
+                break
+
+            with pa.ipc.open_stream(blob[0]) as reader:
+                batches.append(pa.Table.from_batches(reader))
+
+        out = pa.concat_tables(batches)
+        self._rownumber += out.num_rows
+
+        if type(self).output_format == 'dataframe':
+            return out.to_pandas()
+        return out
+
+    def scroll(self, value, mode='relative'):
+        raise self.NotSupportedError(0, 'scrolling is not supported in Arrow cursors')
+
+    def _query(self, q):
+        import pyarrow as pa
+
+        conn = self._get_db()
+        self._first_batch = None
+        self._clear_result()
+
+        if re.search(r'\bselect\b', q, flags=re.I):
+            q = q + ' option (result_arrow_batch=100)'
+            conn.query(q)
+            self._do_get_result()
+
+            # The only way to get the description of the fields is to fetch
+            # the first batch and translate the schema.
+            blob = Cursor.fetchone(self)
+            if blob is not None and len(blob) > 0:
+                with pa.ipc.open_stream(blob[0]) as reader:
+                    self._first_batch = pa.Table.from_batches(reader)
+                    self._description = self._schema_to_description(
+                        self._first_batch.schema,
+                    )
+
+        else:
+            conn.query(q)
+            self._do_get_result()
+
+        return self.rowcount
+
+    def _schema_to_description(self, schema):
+        type_map = {
+            'string': (252, 0, 33),
+            'binary': (252, 0, 63),
+            'long_string': (251, 0, 33),
+            'long_binary': (251, 0, 63),
+            'float': (4, 0, 0),
+            'double': (5, 0, 0),
+            'int8': (1, 0, 0),
+            'uint8': (1, 0, 0),
+            'int16': (2, 0, 0),
+            'uint16': (2, 0, 0),
+            'int32': (3, 0, 0),
+            'uint32': (3, 0, 0),
+            'int64': (8, 0, 0),
+            'uint64': (8, 0, 0),
+            'duration[us]': (11, 0, 0),
+            'duration[ms]': (11, 0, 0),
+            'date32[day]': (10, 0, 0),
+            'timestamp[us]': (12, 0, 0),
+            'timestamp[ms]': (12, 0, 0),
+            'decimal128': (0, 0, 0),
+            'decimal256': (0, 0, 0),
+        }
+
+        description = []
+        for item in schema:
+            key = type_map[str(item.type).split('(', 1)[0]]
+            description.append(
+                Description(
+                    name=item.name,
+                    type_code=key[0],
+                    display_size=None,
+                    internal_size=None,
+                    precision=None,
+                    scale=None,
+                    null_ok=True,
+                    flags=key[1],
+                    charset=key[2],
+                ),
+            )
+        return description
+
+
+class DataFrameCursor(ArrowCursor):
+    """Cursor for returning pandas DataFrames."""
+    output_format = 'dataframe'
 
 
 class SSCursor(Cursor):

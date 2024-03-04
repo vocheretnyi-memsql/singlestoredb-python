@@ -29,6 +29,8 @@ from .cursors import (
     DictCursorSV,
     NamedtupleCursor,
     NamedtupleCursorSV,
+    ArrowCursor,
+    DataFrameCursor,
     SSCursor,
     SSCursorSV,
     SSDictCursor,
@@ -443,6 +445,10 @@ class Connection(BaseConnection):
                 self.cursorclass = DictCursor
             elif 'namedtuple' in self.results_type:
                 self.cursorclass = NamedtupleCursor
+            elif 'arrow' in self.results_type:
+                self.cursorclass = ArrowCursor
+            elif 'dataframe' in self.results_type:
+                self.cursorclass = DataFrameCursor
             else:
                 self.cursorclass = Cursor
         else:
@@ -450,6 +456,10 @@ class Connection(BaseConnection):
                 self.cursorclass = SSDictCursor
             elif 'namedtuple' in self.results_type:
                 self.cursorclass = SSNamedtupleCursor
+            elif 'arrow' in self.results_type:
+                self.cursorclass = ArrowCursor
+            elif 'dataframe' in self.results_type:
+                self.cursorclass = DataFrameCursor
             else:
                 self.cursorclass = SSCursor
 
@@ -466,6 +476,9 @@ class Connection(BaseConnection):
                 )
 
         if self.pure_python is True:
+            pass
+
+        elif self.cursorclass in [ArrowCursor, DataFrameCursor]:
             pass
 
         # The C extension handles these types internally.
