@@ -3,6 +3,7 @@
 # http://dev.mysql.com/doc/internals/en/client-server-protocol.html
 import struct
 import sys
+from enum import Enum
 
 from . import err
 from ..config import get_option
@@ -237,6 +238,11 @@ class MysqlPacket:
     def dump(self):
         dump_packet(self._data)
 
+class ProtocolExtendedTypeCodes(Enum):
+    NONE = 0
+    BSON = 1
+    VECTOR = 2
+
 
 class FieldDescriptorPacket(MysqlPacket):
     """
@@ -264,13 +270,36 @@ class FieldDescriptorPacket(MysqlPacket):
         self.org_table = self.read_length_coded_string().decode(encoding)
         self.name = self.read_length_coded_string().decode(encoding)
         self.org_name = self.read_length_coded_string().decode(encoding)
+
+        # '<': This indicates little-endian byte order, meaning that the least significant byte is stored first.
+        # B: This reads an unsigned char (1 byte).
+        # H: This reads an unsigned short integer (2 bytes).
+        # I: This reads an unsigned integer (4 bytes).
+        # B: This reads an unsigned char (1 byte).
+        # H: This reads another unsigned short integer (2 bytes).
+        # B: This reads another unsigned char (1 byte).
+        # xx: These two x's read and skip two bytes without storing them. (2 bytes left zeroed by MySQL)
+        #
+        bytes_num = 0
         (
+            bytes_num,
             self.charsetnr,
             self.length,
             self.type_code,
             self.flags,
             self.scale,
-        ) = self.read_struct('<xHIBHBxx')
+        ) = self.read_struct('<BHIBHBxx')
+        print("Len: ", bytes_num)
+        if bytes_num > 12:
+            typeCode = self.read_uint8()
+            print("Extended type code: ", typeCode)
+            if typeCode == ProtocolExtendedTypeCodes.BSON.value:
+                print('its BSON')
+            elif typeCode == ProtocolExtendedTypeCodes.VECTOR.value:
+                (vecLen, vecType) = self.read_struct('<IB')
+                print('its VECTOR', vecLen, vecType)
+            else:
+                print('Bad typecode')
         # 'default' is a length coded binary and is still in the buffer?
         # not used for normal result sets...
 
